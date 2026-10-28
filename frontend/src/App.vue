@@ -9,7 +9,7 @@ import UiSidebar, { type SidebarItem } from './components/ui/UiSidebar.vue'
 import AdoptPage from './components/AdoptPage.vue'
 import CleanPage from './components/CleanPage.vue'
 
-const APP_VERSION = 'v0.5.2'
+const APP_VERSION = 'v0.5.3'
 
 const sys = ref<SystemInfo | null>(null)
 const candidates = ref<SynoCandidate[]>([])
@@ -178,7 +178,7 @@ onBeforeUnmount(() => {
         </UiCard>
 
         <UiCard title="疑似群晖数据盘">
-          <template #desc>识别群晖 Basic 单盘卷（mdadm → LVM vg1/volume_1 → btrfs）。检测全程只读。</template>
+          <template #desc>识别群晖数据卷（mdadm → LVM → btrfs），并区分单盘 Basic / RAID 阵列 / 跨盘卷。检测全程只读、不修改数据；当前版本只接管单盘 Basic，RAID 仅识别不接管（v0.6 支持）。</template>
           <template #actions>
             <UiBadge v-if="candidates.length" type="info">{{ candidates.length }} 个候选</UiBadge>
           </template>
@@ -220,14 +220,23 @@ onBeforeUnmount(() => {
           <table v-else>
             <thead>
               <tr>
-                <th>物理盘</th><th>型号</th><th>卷</th><th>大小</th>
+                <th>类型</th><th>物理盘</th><th>型号</th><th>卷</th><th>大小</th>
                 <th>文件系统</th><th>状态</th>
               </tr>
             </thead>
             <tbody>
               <template v-for="c in candidates" :key="c.dmPath">
                 <tr>
-                  <td class="mono">{{ c.disk || '未知' }}</td>
+                  <td>
+                    <UiBadge :type="c.kind === 'basic' ? 'info' : c.kind === 'raid' ? 'ok' : 'warn'">
+                      {{
+                        c.kind === 'raid'
+                          ? `${(c.raidLevel || 'RAID').toUpperCase()} ×${c.raidMembers || c.physDisks?.length || '?'}`
+                          : c.kind === 'basic' ? '单盘 Basic' : '不支持'
+                      }}
+                    </UiBadge>
+                  </td>
+                  <td class="mono">{{ (c.physDisks?.length ?? 0) > 1 ? `${c.physDisks?.length} 块` : (c.disk || '未知') }}</td>
                   <td>{{ c.model || '—' }}</td>
                   <td class="mono">{{ c.vg }}/{{ c.lv }}</td>
                   <td>{{ c.lvSize }}</td>
@@ -238,11 +247,20 @@ onBeforeUnmount(() => {
                     </UiBadge>
                   </td>
                 </tr>
+                <tr v-if="c.kind === 'raid'">
+                  <td colspan="7" class="sub">
+                    阵列 {{ c.mdDev }} · {{ c.raidHealth || '未知状态' }} · 在线
+                    {{ c.raidActive || '?' }}/{{ c.raidMembers || '?' }} · {{ c.raidSize || '—' }}
+                    <template v-if="c.physDisks?.length">
+                      <br />成员盘：{{ c.physDisks.join('、') }}
+                    </template>
+                  </td>
+                </tr>
                 <tr v-if="c.subvols?.length">
-                  <td colspan="6" class="sub">子卷：{{ c.subvols.join('、') }}</td>
+                  <td colspan="7" class="sub">子卷：{{ c.subvols.join('、') }}</td>
                 </tr>
                 <tr v-for="n in c.notes ?? []" :key="n">
-                  <td colspan="6" class="sub warn-text">⚠ {{ n }}</td>
+                  <td colspan="7" class="sub warn-text">⚠ {{ n }}</td>
                 </tr>
               </template>
             </tbody>

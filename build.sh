@@ -14,7 +14,7 @@ if command -v gofmt >/dev/null 2>&1; then
     exit 1
   fi
 fi
-(cd server && go vet ./... ) || { echo "go vet 未通过"; exit 1; }
+(cd server && go vet ./... && go test ./... ) || { echo "go vet / go test 未通过"; exit 1; }
 
 echo "==> [1/5] 前端类型检查（vue-tsc，缺失则跳过）"
 if (cd frontend && npm run type-check); then

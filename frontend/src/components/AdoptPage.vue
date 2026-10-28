@@ -222,6 +222,7 @@ onActivated(() => {
         <thead>
           <tr>
             <th style="width: 36px"></th>
+            <th>类型</th>
             <th>物理盘</th><th>型号</th><th>卷组</th><th>大小</th>
             <th>文件系统</th><th>状态</th><th>操作</th>
           </tr>
@@ -234,6 +235,15 @@ onActivated(() => {
                   v-if="c.adoptable" type="checkbox"
                   :checked="selected.has(c.vgUuid)" @change="toggle(c)"
                 />
+              </td>
+              <td>
+                <UiBadge :type="c.kind === 'basic' ? 'info' : c.kind === 'raid' ? 'ok' : 'warn'">
+                  {{
+                    c.kind === 'raid'
+                      ? `${(c.raidLevel || 'RAID').toUpperCase()} ×${c.raidMembers || '?'}`
+                      : c.kind === 'basic' ? '单盘 Basic' : '不支持'
+                  }}
+                </UiBadge>
               </td>
               <td class="mono">{{ c.disk || '未知' }}</td>
               <td>{{ c.model || '—' }}</td>
@@ -253,10 +263,10 @@ onActivated(() => {
               </td>
             </tr>
             <tr v-if="c.subvols?.length">
-              <td colspan="8" class="sub">子卷：{{ c.subvols.join('、') }}</td>
+              <td colspan="9" class="sub">子卷：{{ c.subvols.join('、') }}</td>
             </tr>
             <tr v-for="n in c.notes ?? []" :key="n">
-              <td colspan="8" class="sub warn-text">⚠ {{ n }}</td>
+              <td colspan="9" class="sub warn-text">⚠ {{ n }}</td>
             </tr>
           </template>
         </tbody>

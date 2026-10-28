@@ -20,6 +20,16 @@ export interface SynoCandidate {
   subvols: string[] | null   // 后端保证非 null，前端仍做兼容
   adoptable: boolean
   notes: string[] | null
+
+  // 类型与阵列信息（分类由检测决定）
+  kind: 'basic' | 'raid' | 'unsupported'
+  mdDev: string
+  raidLevel: string
+  raidMembers: number
+  raidActive: number
+  raidHealth: string
+  raidSize: string
+  physDisks: string[] | null
 }
 
 export interface Disk {

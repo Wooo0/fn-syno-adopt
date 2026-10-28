@@ -234,6 +234,7 @@ func BuildPlan(vgUuid string) (*Plan, error) {
 		"mount -o rw,noatime,trimacl,space_cache=v2 " + p.DMPath + " " + p.MountPoint,
 		"pg_dump 备份 mount 表 -> " + BackupRoot + "/<时间戳>/mount_before.sql",
 		"INSERT INTO mount (id=" + strconv.Itoa(p.VolID) + ", uuid=" + p.MUUID + ")",
+		"mdadm.conf 持久化：追加 ARRAY 行（带 # fn-syno-adopt 标记），保证重启后阵列自动组装",
 		"验证：挂载点生效 + mount 表含新记录",
 	}
 	return p, nil
@@ -501,12 +502,17 @@ func Execute(p *Plan, dryRun bool, rec *jobs.Recorder) error {
 		}
 		sl2.Done("ok", fmt.Sprintf("id=%d uuid=%s 已注册", p.VolID, p.MUUID))
 
+		// 10.5 mdadm 阵列持久化：没有这步，重启后 1.2 超级块阵列不会自动组装，
+		//     /volN 挂载不上。单盘 Basic 一样受益（群晖数据分区也走在 md 上）。
+		PersistMdadmConf(p.VGUuid, rec)
+
 		// 11. 写接管记录：这是回滚的唯一依据（飞牛原生卷同样叫 trim_xxx/0，
 		// 没有记录就无法区分"我们接管的"和"飞牛自己的"）
 		if err := SaveRecord(Record{
 			VGUuid: p.VGUuid, OldVG: p.OldVG, NewVG: p.NewVG, OldLV: "volume_1",
 			VolID: p.VolID, MountPoint: p.MountPoint, MUUID: p.MUUID,
 			Disk: p.Disk, LVSize: p.LVSize, Time: Stamp(),
+			MdUUIDs: mdUUIDsOfVG(p.VGUuid),
 		}); err != nil {
 			step("记录接管信息", "", "warn",
 				"写入 "+recordsPath()+" 失败: "+err.Error()+

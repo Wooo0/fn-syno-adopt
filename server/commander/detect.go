@@ -53,7 +53,24 @@ type SynoCandidate struct {
 	Subvols   []string `json:"subvols"`
 	Adoptable bool     `json:"adoptable"` // 满足接管前置条件（vg1/volume_1 + btrfs + 单盘）
 	Notes     []string `json:"notes"`
+
+	// —— 类型与阵列信息（分类由检测决定，不由用户选择）——
+	Kind        string   `json:"kind"`        // basic / raid / unsupported
+	MdDev       string   `json:"mdDev"`       // 底层 md 阵列设备（如 /dev/md2），非阵列时为空
+	RaidLevel   string   `json:"raidLevel"`   // raid5 / raid1 ...
+	RaidMembers int      `json:"raidMembers"` // 阵列成员总数
+	RaidActive  int      `json:"raidActive"`  // 当前在线成员数
+	RaidHealth  string   `json:"raidHealth"`  // clean / degraded / recovering ...
+	RaidSize    string   `json:"raidSize"`
+	PhysDisks   []string `json:"physDisks"` // 关联的物理盘列表
 }
+
+// Kind 候选盘类型常量。
+const (
+	KindBasic       = "basic"       // 群晖 Basic 单盘：单 PV 且落在单块物理盘上
+	KindRAID        = "raid"        // 单个 md 阵列、成员 ≥2（RAID1/5/6/10）
+	KindUnsupported = "unsupported" // 真跨盘卷 / 阵列不健康 / 其它
+)
 
 // ---------- 只读探测 ----------
 
@@ -287,6 +304,94 @@ func MdUnassembled() []string {
 	return out
 }
 
+// MdDetail mdadm --detail 解析结果（RAID 拓扑与健康状态）。
+type MdDetail struct {
+	Dev     string // /dev/md0
+	Level   string // raid5 / raid1 / raid0 ...
+	Members int    // Raid Devices（阵列成员总数）
+	Active  int    // Active Devices（当前在线数）
+	State   string // clean / degraded / recovering / resyncing ...
+	UUID    string
+	Size    string
+}
+
+// MdDetailOf 读取一个 md 阵列的拓扑与状态（只读）。
+func MdDetailOf(dev string) MdDetail {
+	d := MdDetail{Dev: dev}
+	r, err := Run(15*time.Second, "mdadm", "--detail", dev)
+	if err != nil {
+		return d
+	}
+	for _, line := range strings.Split(r.Stdout, "\n") {
+		kv := strings.SplitN(line, ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key, val := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+		switch key {
+		case "Raid Level":
+			d.Level = val
+		case "Raid Devices":
+			d.Members = atoiSafe(strings.Fields(val)[0])
+		case "Active Devices":
+			d.Active = atoiSafe(strings.Fields(val)[0])
+		case "State":
+			d.State = val // 形如 "clean" / "clean, degraded" / "clean, recovering"
+		case "Array Size":
+			d.Size = val
+		case "UUID":
+			d.UUID = val
+		}
+	}
+	if d.State == "" && d.Level != "" {
+		// 无冗余级别（raid0）没有 State 行，用成员数兜底
+		d.State = "clean"
+	}
+	return d
+}
+
+// MdHealthy 判断阵列是否处于可接管状态。
+// degraded / recovering / resyncing / resync 一律视为不健康——此时接管风险极高。
+func MdHealthy(d MdDetail) bool {
+	s := strings.ToLower(d.State)
+	if strings.Contains(s, "degraded") || strings.Contains(s, "recovering") ||
+		strings.Contains(s, "resyncing") || strings.Contains(s, "resync") ||
+		strings.Contains(s, "rebuilding") {
+		return false
+	}
+	if d.Members > 0 && d.Active > 0 && d.Active < d.Members {
+		return false // 有成员掉线
+	}
+	return strings.Contains(s, "clean") || d.State == ""
+}
+
+// MdConfLine 返回可直接写进 mdadm.conf 的 ARRAY 行（官方推荐的生成方式）。
+// 输出形如：ARRAY /dev/md/0 metadata=1.2 UUID=xxxx name=host:0
+func MdConfLine(dev string) string {
+	r, err := Run(15*time.Second, "mdadm", "--detail", "--scan", dev)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(strings.TrimSpace(r.Stdout), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "ARRAY") {
+			return strings.TrimSpace(line)
+		}
+	}
+	return ""
+}
+
+// atoiSafe 解析整数，失败返回 0。
+func atoiSafe(s string) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
 // MdAssemble 组装全部可组装的 mdadm 阵列（幂等：已激活的阵列自动跳过）。
 func MdAssemble() (string, error) {
 	r, err := Run(120*time.Second, "mdadm", "--assemble", "--scan")
@@ -348,10 +453,14 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 		}
 
 		// 物理盘归属：PV -> (md 阵列) -> 成员分区 -> 物理盘（按 VG UUID 匹配，容忍重名）
+		// 同时记下 PV 里有哪些是 md 阵列：区分"多块盘组成的 RAID"与"真跨盘卷"全靠它。
 		var physDisks []string
-		for _, pv := range PVsOfVG(lv.VGUuid) {
+		var mdDevs []string
+		pvs := PVsOfVG(lv.VGUuid)
+		for _, pv := range pvs {
 			switch {
 			case strings.HasPrefix(pv, "/dev/md"):
+				mdDevs = append(mdDevs, pv)
 				for _, m := range MdMembers(pv) {
 					physDisks = append(physDisks, stripPartition(m))
 				}
@@ -360,6 +469,7 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 			}
 		}
 		physDisks = dedup(physDisks)
+		c.PhysDisks = physDisks
 		switch {
 		case len(physDisks) == 1:
 			c.Disk = physDisks[0]
@@ -372,6 +482,36 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 				strings.Join(physDisks, ", ")))
 		default:
 			c.Notes = append(c.Notes, "未能定位物理盘（md 阵列可能未组装，或为未激活的 LVM）")
+		}
+
+		// —— 类型判定：单盘 Basic / RAID / 不支持 ——
+		// 关键区分点：多块物理盘 ≠ RAID。在同一个 md 阵列上 = RAID 候选；
+		// PV 散在多块盘或多个阵列上 = 真跨盘卷，仍然拒绝。
+		c.Kind = KindUnsupported // 默认不支持，下面按证据放宽
+		switch {
+		case len(mdDevs) == 1 && len(physDisks) >= 2:
+			d := MdDetailOf(mdDevs[0])
+			c.MdDev, c.RaidLevel = mdDevs[0], d.Level
+			c.RaidMembers, c.RaidActive, c.RaidHealth, c.RaidSize = d.Members, d.Active, d.State, d.Size
+			if !MdHealthy(d) {
+				c.Kind = KindUnsupported
+				c.Notes = append(c.Notes, fmt.Sprintf(
+					"阵列状态异常（%s，在线 %d/%d）：降级/重建中的阵列禁止接管，请先修复阵列",
+					d.State, d.Active, d.Members))
+			} else {
+				c.Kind = KindRAID
+				c.Notes = append(c.Notes, fmt.Sprintf(
+					"检测到 %d 盘 %s 阵列（状态 %s）：RAID 接管将在 v0.6 提供，当前版本仅识别不接管",
+					d.Members, d.Level, d.State))
+			}
+		case len(mdDevs) > 1 || len(pvs) > 1:
+			c.Kind = KindUnsupported
+			if len(mdDevs) > 1 {
+				c.Notes = append(c.Notes, "卷组跨多个 md 阵列（"+strings.Join(mdDevs, ", ")+"），不支持接管")
+			}
+		default:
+			// 单物理盘（群晖 Basic 常是单成员 md 阵列或直接分区）
+			c.Kind = KindBasic
 		}
 
 		if c.DMPath != "" {

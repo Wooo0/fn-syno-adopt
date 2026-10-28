@@ -209,6 +209,7 @@ func Rollback(vgUuid string, dryRun bool, rec *jobs.Recorder) error {
 		step("回滚逻辑卷名", "lvrename "+tgt.OldVG+" "+curLV+" "+tgt.OldLV, "pending", "演练")
 		step("删除 mount 表行", "DELETE FROM mount WHERE id="+strconv.Itoa(tgt.VolID)+
 			" AND uuid='"+tgt.MUUID+"'", "pending", "演练")
+		step("移除阵列开机自动组装配置", "从 mdadm.conf 移除本应用写入的 ARRAY 行", "pending", "演练")
 		step("删除接管记录", "(演练不写文件)", "pending", "演练")
 		return nil
 	}
@@ -255,6 +256,9 @@ func Rollback(vgUuid string, dryRun bool, rec *jobs.Recorder) error {
 	} else {
 		step("回滚逻辑卷名", "(已是 "+tgt.OldLV+")", "ok", "跳过")
 	}
+
+	// 4.5 移除 mdadm.conf 里本应用写过的 ARRAY 行（其它行不动）
+	RemoveMdadmConf(tgt.MdUUIDs, rec)
 
 	// 5. 收尾：删除记录 + 提示
 	if err := RemoveRecord(vgUuid); err != nil {

@@ -32,6 +32,9 @@ type Record struct {
 	Disk       string `json:"disk"`       // 物理盘（展示用）
 	LVSize     string `json:"lvSize"`
 	Time       string `json:"time"` // 接管时间
+	// MdUUIDs 卷底层 md 阵列的 UUID（用于回滚时从 mdadm.conf 移除我们写过的行）。
+	// v0.5.x 的老记录没有这个字段，反序列后为空 → 回滚跳过移除，向后兼容。
+	MdUUIDs []string `json:"mdUuids,omitempty"`
 }
 
 // recordsPath 记录文件绝对路径。
