@@ -1,23 +1,49 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
-  api, type EaDirScanResult, type OwnerScanResult, type SuggestUser,
+  api, type AdoptedVolume, type EaDirScanResult, type Job,
+  type OwnerScanResult, type SuggestUser,
 } from '../api'
 import UiButton from './ui/UiButton.vue'
 import UiCard from './ui/UiCard.vue'
 import UiBadge from './ui/UiBadge.vue'
 import UiEmpty from './ui/UiEmpty.vue'
 import JobLog from './JobLog.vue'
+import DoneCard from './DoneCard.vue'
 
 type Tab = 'owner' | 'eadir'
 const tab = ref<Tab>('owner')
 
+// —— 默认路径推断 ——
+// /vol1 是飞牛系统卷，写死成默认值会让用户白扫几分钟，甚至对自己的系统卷动 chown。
+// 优先级（显式行为 > 自动推断 > 兜底）：
+//   1. localStorage：用户上一次扫描成功的路径（显式选择，最贴近意图）
+//   2. 最近一条接管记录的 mountPoint（群晖盘一般落在 /vol2+）
+//   3. /vol1
+const LS_KEY_OWNER = 'fn-syno-adopt.lastPath.owner'
+const LS_KEY_EA = 'fn-syno-adopt.lastPath.eadir'
+
+const adopted = ref<AdoptedVolume[]>([])
+const latestAdopted = computed<AdoptedVolume | null>(() => {
+  if (!adopted.value.length) return null
+  // VolID 最大的即最近接管的卷
+  return adopted.value.reduce((a, b) => (b.volId > a.volId ? b : a))
+})
+
+function defaultPath(lsKey: string): string {
+  const saved = localStorage.getItem(lsKey)
+  if (saved) return saved
+  if (latestAdopted.value?.mountPoint) return latestAdopted.value.mountPoint
+  return '/vol1'
+}
+
 // —— 所有权修复 ——
-const ownerPath = ref('/vol1')
+const ownerPath = ref(defaultPath(LS_KEY_OWNER))
 const ownerScanRes = ref<OwnerScanResult | null>(null)
 const ownerScanning = ref(false)
 const ownerRunning = ref(false)
 const ownerConfirm = ref('')
+const ownerDone = ref(false)
 const removeAcl = ref(true)
 const uid = ref<number | null>(null)
 const gid = ref<number | null>(null)
@@ -31,14 +57,26 @@ async function scanOwner() {
   ownerScanning.value = true
   ownerError.value = ''
   ownerScanRes.value = null
+  ownerDone.value = false
   try {
     const res = await api.ownerScan(ownerPath.value)
     ownerScanRes.value = res.data
+    localStorage.setItem(LS_KEY_OWNER, ownerPath.value) // 记住这次显式选择的路径
   } catch (e) {
     ownerError.value = e instanceof Error ? e.message : String(e)
   } finally {
     ownerScanning.value = false
   }
+}
+
+// 把最近接管的卷填进路径框（覆盖当前值，作为显式选择被记住）
+function fillLatest() {
+  const p = latestAdopted.value?.mountPoint
+  if (!p) return
+  ownerPath.value = p
+  eaPath.value = p
+  localStorage.setItem(LS_KEY_OWNER, p)
+  localStorage.setItem(LS_KEY_EA, p)
 }
 
 function applySuggest(s: SuggestUser | null) {
@@ -71,18 +109,21 @@ async function runOwnerRepair(dryRun: boolean) {
   }
 }
 
-function onOwnerJobDone() {
+function onOwnerJobDone(job: Job | null) {
   ownerRunning.value = false
+  ownerDone.value = !!job && job.status === 'done'
 }
 
 // —— @eaDir 清理 ——
-const eaPath = ref('/vol1')
+const eaPath = ref(defaultPath(LS_KEY_EA))
 const eaRes = ref<EaDirScanResult | null>(null)
 const eaScanning = ref(false)
 const eaRunning = ref(false)
 const eaConfirm = ref('')
 const eaJobId = ref<string | null>(null)
 const eaError = ref('')
+const eaDone = ref(false)
+const eaTrash = ref('') // 清理完成后的回收站路径
 
 const canEaClean = ref(false)
 
@@ -90,9 +131,11 @@ async function scanEa() {
   eaScanning.value = true
   eaError.value = ''
   eaRes.value = null
+  eaDone.value = false
   try {
     const res = await api.eadirScan(eaPath.value)
     eaRes.value = res.data
+    localStorage.setItem(LS_KEY_EA, eaPath.value)
   } catch (e) {
     eaError.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -112,8 +155,13 @@ async function runEaClean(dryRun: boolean) {
   }
 }
 
-function onEaJobDone() {
+function onEaJobDone(job: Job | null) {
   eaRunning.value = false
+  eaDone.value = !!job && job.status === 'done'
+  if (eaDone.value) {
+    const root = eaPath.value.match(/^\/vol\d+/)?.[0] ?? eaPath.value
+    eaTrash.value = `${root}/.fn-syno-adopt-trash/`
+  }
 }
 
 onMounted(async () => {
@@ -121,6 +169,14 @@ onMounted(async () => {
     const s = await api.sysUsers()
     applySuggest(s.suggest)
   } catch { /* 忽略：用户可手填 */ }
+  // 拉接管记录用于默认路径推断（失败不影响手工填路径）
+  try {
+    const res = await api.adopted()
+    adopted.value = res.volumes ?? []
+    // 用户从未手工扫过时（无 localStorage），跟随最近接管的卷
+    if (!localStorage.getItem(LS_KEY_OWNER)) ownerPath.value = defaultPath(LS_KEY_OWNER)
+    if (!localStorage.getItem(LS_KEY_EA)) eaPath.value = defaultPath(LS_KEY_EA)
+  } catch { /* 忽略 */ }
 })
 </script>
 
@@ -145,7 +201,13 @@ onMounted(async () => {
 
       <div class="path-row">
         <input v-model="ownerPath" class="path-input mono" :disabled="ownerRunning" spellcheck="false" />
-        <p class="hint">仅允许 /volN 开头的路径。大卷扫描可能耗时数分钟。</p>
+        <UiButton v-if="latestAdopted?.mountPoint" variant="ghost" @click="fillLatest">
+          最近接管：{{ latestAdopted.mountPoint }}
+        </UiButton>
+        <p class="hint">
+          仅允许 /volN 开头的路径（默认已指向最近接管的卷，/vol1 是飞牛系统卷，一般不是你要修的盘）。
+          大卷扫描可能耗时数分钟：百万级文件约需数分钟，可离开本页，任务在后台继续。
+        </p>
       </div>
 
       <p v-if="ownerError" class="err-text">✗ {{ ownerError }}</p>
@@ -211,6 +273,15 @@ onMounted(async () => {
       </div>
       <p class="hint">正式修复会递归改写整卷属主，耗时与文件数量成正比（百万级文件可能需要数十分钟）。任务在后台执行，可离开页面。</p>
       <JobLog :job-id="ownerJobId" @finished="onOwnerJobDone" />
+      <DoneCard
+        v-if="ownerDone"
+        title="所有权修复完成"
+        :items="[
+          `已把 ${ownerPath} 下的文件属主改为 ${uid}:${gid}`,
+          '到飞牛文件管理器确认你的用户可以正常读写',
+          '接着做 @eaDir 清理（切换到上方标签页），清掉群晖遗留的缩略图缓存',
+        ]"
+      />
     </UiCard>
   </template>
 
@@ -229,7 +300,10 @@ onMounted(async () => {
 
       <div class="path-row">
         <input v-model="eaPath" class="path-input mono" :disabled="eaRunning" spellcheck="false" />
-        <p class="hint">仅允许 /volN 开头的路径。</p>
+        <UiButton v-if="latestAdopted?.mountPoint" variant="ghost" @click="fillLatest">
+          最近接管：{{ latestAdopted.mountPoint }}
+        </UiButton>
+        <p class="hint">仅允许 /volN 开头的路径。目录很多时扫描需数分钟，可离开本页，任务在后台继续。</p>
       </div>
 
       <p v-if="eaError" class="err-text">✗ {{ eaError }}</p>
@@ -269,6 +343,15 @@ onMounted(async () => {
         />
       </div>
       <JobLog :job-id="eaJobId" @finished="onEaJobDone" />
+      <DoneCard
+        v-if="eaDone"
+        title="@eaDir 已移入回收站"
+        :items="[
+          `回收站位置：${eaTrash}<时间戳>/（保留原目录树，随时可原样移回）`,
+          '到飞牛文件管理器打开该目录核对，确认无用后手动清空即完成删除',
+          '应用不会自动删除任何数据，最终删除权在你手上',
+        ]"
+      />
     </UiCard>
   </template>
 </template>
@@ -291,7 +374,8 @@ onMounted(async () => {
   color: #FFF;
 }
 
-.path-row { margin: 10px 0; }
+.path-row { margin: 10px 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.path-row .hint { flex-basis: 100%; }
 .form-label { font-size: 13px; color: var(--fui-text-2); margin-right: 8px; }
 .path-input {
   border: 1px solid var(--fui-border);

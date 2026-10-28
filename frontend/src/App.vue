@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { api, type SynoCandidate, type SystemInfo } from './api'
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
+import { api, type AdoptedVolume, type SynoCandidate, type SystemInfo } from './api'
 import UiButton from './components/ui/UiButton.vue'
 import UiCard from './components/ui/UiCard.vue'
 import UiBadge from './components/ui/UiBadge.vue'
@@ -9,15 +9,14 @@ import UiSidebar, { type SidebarItem } from './components/ui/UiSidebar.vue'
 import AdoptPage from './components/AdoptPage.vue'
 import CleanPage from './components/CleanPage.vue'
 
-const APP_VERSION = 'v0.5.0'
+const APP_VERSION = 'v0.5.1'
 
 const sys = ref<SystemInfo | null>(null)
 const candidates = ref<SynoCandidate[]>([])
 const error = ref('')
 const loading = ref(false)
 const page = ref('detect')
-
-// md 阵列自救：群晖 1.2 超级块不会被内核自动组装，候选为空时提供组装入口
+const adopted = ref<AdoptedVolume[]>([])
 const mdArrays = ref<string[]>([])
 const mdMsg = ref('')
 const mdBusy = ref(false)
@@ -55,6 +54,48 @@ const statusOk = computed<boolean | undefined>(() =>
   error.value ? false : sys.value ? true : undefined,
 )
 
+// 检测面板只找 vg1/volume_1，接管成功的盘改名成 trim_xxx 后会被跳过，
+// 候选列表随之变空。不解释的话用户第一反应是"我的盘呢？是不是失败了"。
+const adoptableCount = computed(() => candidates.value.filter((c) => c.adoptable).length)
+// 注意带上 mdArrays 为空的条件：用户又接入一块新群晖盘时，候选为空但有未组装阵列，
+// 此时要让位给"组装阵列"入口，而不是显示"已接管完成"。
+const allAdopted = computed(
+  () => candidates.value.length === 0 && mdArrays.value.length === 0 && adopted.value.length > 0,
+)
+
+async function loadAdopted() {
+  try {
+    const res = await api.adopted()
+    adopted.value = res.volumes ?? []
+  } catch {
+    adopted.value = []
+  }
+}
+
+// 全局运行中的任务：大卷 chown 要跑几十分钟，用户切到别的页面就看不到进度了
+// （任务本身在后台继续，切回来 JobLog 会自动续轮询，这里只是补一个可见入口）
+const runningJob = ref<{ kind: string; label: string; page: string } | null>(null)
+let jobTimer: number | undefined
+
+const kindLabel: Record<string, string> = {
+  adopt: '磁盘接管', 'owner-repair': '所有权修复', 'eadir-clean': '@eaDir 清理', rollback: '回滚',
+}
+const kindPage: Record<string, string> = {
+  adopt: 'adopt', rollback: 'adopt', 'owner-repair': 'clean', 'eadir-clean': 'clean',
+}
+
+async function pollRunning() {
+  try {
+    const res = await api.jobs()
+    const live = (res.jobs ?? []).find((j) => j.status === 'running')
+    runningJob.value = live
+      ? { kind: live.kind, label: kindLabel[live.kind] ?? live.kind, page: kindPage[live.kind] ?? 'detect' }
+      : null
+  } catch {
+    runningJob.value = null
+  }
+}
+
 async function load() {
   loading.value = true
   error.value = ''
@@ -70,7 +111,15 @@ async function load() {
   }
 }
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+  await loadAdopted()
+  await pollRunning()
+  jobTimer = window.setInterval(pollRunning, 5000)
+})
+onBeforeUnmount(() => {
+  if (jobTimer !== undefined) window.clearInterval(jobTimer)
+})
 </script>
 
 <template>
@@ -89,6 +138,26 @@ onMounted(load)
         <svg v-else viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
           <path d="M9.5 2.5 L13.5 6.5" stroke-linecap="round" /><path d="M8 5 L11 8 L5.5 13.5 H2.5 V10.5 Z" stroke-linejoin="round" />
         </svg>
+      </template>
+
+      <!-- 迷你流程条：告诉首次用户全貌与"我在哪" -->
+      <template #flow>
+        <button
+          v-for="(it, i) in navItems" :key="it.key"
+          class="flow-node" :class="{ 'is-active': it.key === page, 'is-done': navItems.findIndex((n) => n.key === page) > i }"
+          @click="page = it.key"
+        >
+          <span class="flow-dot">{{ i + 1 }}</span>
+          <span v-if="i < navItems.length - 1" class="flow-line"></span>
+        </button>
+        <div class="flow-legend">{{ navItems.find((n) => n.key === page)?.label }}</div>
+      </template>
+
+      <!-- 运行中任务：切页也能看到进度，点击跳回 -->
+      <template #task>
+        <button v-if="runningJob" class="task-live" @click="page = runningJob.page">
+          <span class="dot"></span>{{ runningJob.label }} 进行中 · 查看
+        </button>
       </template>
     </UiSidebar>
 
@@ -114,10 +183,27 @@ onMounted(load)
             <UiBadge v-if="candidates.length" type="info">{{ candidates.length }} 个候选</UiBadge>
           </template>
 
-          <UiEmpty v-if="candidates.length === 0 && mdArrays.length === 0">
+          <UiEmpty v-if="candidates.length === 0 && mdArrays.length === 0 && !allAdopted">
             未发现群晖特征卷（vg1/volume_1）
             <template #hint>请确认群晖盘已接入本机，且 mdadm 阵列已组装</template>
           </UiEmpty>
+
+          <!-- 接管成功后盘"消失"的解释：不是失败，是已经接管完成 -->
+          <div v-else-if="allAdopted" class="adopted-strip">
+            <p class="adopted-title">✓ 你的群晖盘已经接管完成，这里不再列出是正常现象</p>
+            <p class="adopted-desc">
+              接管后卷组会改名为飞牛约定的 trim_xxx 并挂载到 /volN，检测面板只找群晖原样的
+              vg1/volume_1，所以候选列表为空。
+            </p>
+            <div v-for="v in adopted" :key="v.vgUuid" class="adopted-item mono">
+              {{ v.vg }} → {{ v.mountPoint || '（未挂载）' }}
+              <span v-if="v.disk">· {{ v.disk }}</span>
+            </div>
+            <div class="adopted-actions">
+              <UiButton @click="page = 'clean'">下一步：修复文件所有权</UiButton>
+              <UiButton variant="ghost" @click="page = 'adopt'">查看 / 回滚已接管卷</UiButton>
+            </div>
+          </div>
 
           <div v-else-if="candidates.length === 0" class="md-panel">
             <p class="md-title">检测到 {{ mdArrays.length }} 个群晖 mdadm 阵列特征，但尚未组装</p>
@@ -163,8 +249,13 @@ onMounted(load)
           </table>
         </UiCard>
 
-        <div class="info-strip">
-          检测阶段全程只读。确认候选盘无误后，到「磁盘接管」生成接管计划；接管完成后用「清理工具」修复所有权并清理 @eaDir。
+        <!-- 有可接管盘时升级为行动条，别让用户自己猜下一步去哪 -->
+        <div v-if="adoptableCount" class="next-strip">
+          <span>发现 <b>{{ adoptableCount }}</b> 块可接管磁盘</span>
+          <UiButton @click="page = 'adopt'">去磁盘接管</UiButton>
+        </div>
+        <div v-else class="info-strip">
+          检测阶段不修改数据。确认候选盘无误后，到「磁盘接管」生成接管计划；接管完成后用「清理工具」修复所有权并清理 @eaDir。
         </div>
       </template>
 
@@ -254,4 +345,50 @@ tbody tr:last-child td { border-bottom: 0; }
   color: var(--fui-red);
   border: 1px solid rgba(220, 38, 38, 0.2);
 }
+
+/* 侧栏迷你流程条 / 运行中任务指示 */
+.flow-node {
+  display: inline-flex; align-items: center; border: 0; background: transparent;
+  padding: 0; cursor: pointer; font-family: inherit;
+}
+.flow-dot {
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--fui-grey); color: #FFF; font-size: 10px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.flow-node.is-done .flow-dot { background: var(--fui-green); }
+.flow-node.is-active .flow-dot { background: var(--fui-primary); }
+.flow-line { width: 20px; height: 2px; background: var(--fui-grey); }
+.flow-node.is-done .flow-line { background: var(--fui-green); }
+.flow-legend { font-size: 11px; color: var(--fui-text-2); margin-top: 4px; }
+.task-live {
+  border: 0; background: rgba(55, 140, 190, 0.1); color: var(--fui-blue);
+  border-radius: 999px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+  font-family: inherit; display: inline-flex; align-items: center; gap: 6px;
+}
+.task-live .dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--fui-blue);
+}
+
+/* 接管完成后"盘去哪了"的解释条 */
+.adopted-strip {
+  background: rgba(0, 167, 87, 0.07);
+  border: 1px solid rgba(0, 167, 87, 0.25);
+  border-radius: 8px; padding: 14px 16px;
+}
+.adopted-title { margin: 0 0 6px; font-weight: 600; color: var(--fui-green); font-size: 13px; }
+.adopted-desc { margin: 0; font-size: 12px; color: var(--fui-text-2); }
+.adopted-item {
+  background: var(--fui-panel); border-radius: 6px; padding: 6px 12px;
+  font-size: 12px; color: var(--fui-text-2); margin-top: 8px; word-break: break-all;
+}
+.adopted-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+
+/* 有货时的下一步行动条 */
+.next-strip {
+  background: var(--fui-panel); border: 1px solid var(--fui-border);
+  border-radius: 8px; padding: 10px 16px; font-size: 13px; color: var(--fui-text-2);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.next-strip b { color: var(--fui-primary); }
 </style>

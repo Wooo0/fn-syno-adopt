@@ -34,6 +34,10 @@ defineEmits<{ (e: 'update:modelValue', key: string): void }>()
     </nav>
 
     <div class="ui-side__footer">
+      <!-- 迷你流程条：检测 → 接管 → 清理，当前节点高亮（可选插槽） -->
+      <div v-if="$slots.flow" class="ui-side__flow"><slot name="flow" /></div>
+      <!-- 运行中任务指示（可选插槽）：切页后仍能看见进度并跳回 -->
+      <div v-if="$slots.task"><slot name="task" /></div>
       <div v-if="version" class="ui-side__ver">{{ version }}</div>
       <span v-if="statusOk !== undefined" class="ui-side__status" :class="statusOk ? 'is-ok' : 'is-err'">
         {{ statusOk ? '运行正常' : '服务离线' }}

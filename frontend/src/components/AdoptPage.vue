@@ -6,6 +6,7 @@ import UiCard from './ui/UiCard.vue'
 import UiBadge from './ui/UiBadge.vue'
 import UiEmpty from './ui/UiEmpty.vue'
 import JobLog from './JobLog.vue'
+import DoneCard from './DoneCard.vue'
 
 const candidates = ref<SynoCandidate[]>([])
 const loading = ref(false)
@@ -97,12 +98,15 @@ async function onJobFinished(job: Job | null) {
     load() // 刷新检测，让已改名的盘状态可见
     return
   }
+  adoptDonePoint.value = runQueue.value[0]?.mountPoint ?? adoptDonePoint.value
   finished.value++
   runQueue.value.shift()
   if (runQueue.value.length) {
     runQueueStep()
   } else {
     running.value = false
+    // 收尾卡片：只在整队跑完且是正式接管时出现（演练/回滚/修复都不触发）
+    adoptDone.value = runMode.value === 'real'
     // 计划已消费（挂载点/卷名均已生效），清空防止用旧计划重复执行
     plans.value = []
     confirmText.value = ''
@@ -115,6 +119,8 @@ function startRun(mode: 'dry' | 'real') {
   if (!plans.value.length || running.value) return
   if (mode === 'real' && !canRealRun.value) return
   runMode.value = mode
+  adoptDone.value = false
+  adoptDonePoint.value = ''
   runQueue.value = [...plans.value]
   runTotal.value = plans.value.length
   runIndex.value = 0
@@ -157,6 +163,11 @@ function onRollbackJobDone() {
   loadAdopted()
   load()
 }
+
+// 接管成功的收尾指引：只认 kind='adopt' 且终态 done，
+// rollback / 演练都不触发（演练时 job 也是 done，故额外排除 dry 模式）
+const adoptDone = ref(false)
+const adoptDonePoint = ref('')
 
 async function activate(c: SynoCandidate) {
   error.value = ''
@@ -286,6 +297,16 @@ onMounted(async () => {
       </div>
       <p class="hint">正式接管会改写 LVM 元数据与飞牛存储注册表（数据不动）。请确保已对核心数据做过备份，且群晖系统已关机。</p>
       <JobLog :job-id="jobId" @finished="onJobFinished" />
+      <DoneCard
+        v-if="adoptDone"
+        title="接管完成"
+        :items="[
+          `去飞牛「存储管理器」确认新存储空间${adoptDonePoint ? '（' + adoptDonePoint + '）' : ''}；未显示就刷新页面或重启系统`,
+          '打开「清理工具 → 所有权修复」，把群晖遗留 uid 改成你的飞牛用户（否则文件可能读写不了）',
+          '再执行「@eaDir 清理」，清掉群晖的缩略图缓存目录',
+          '万一不对：下方「已接管卷 / 回滚」可一键还原回群晖原样',
+        ]"
+      />
     </div>
   </UiCard>
 

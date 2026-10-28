@@ -184,4 +184,5 @@ export const api = {
     post<{ ok: boolean; jobId: string }>('api/eadir/clean', { path, dryRun, confirm }),
 
   job: (id: string) => get<{ ok: boolean; job: Job }>(`api/jobs/${encodeURIComponent(id)}`),
+  jobs: () => get<{ ok: boolean; jobs: Job[] | null }>('api/jobs'),
 }
