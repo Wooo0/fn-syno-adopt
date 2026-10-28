@@ -1,0 +1,6 @@
+# 统一 LF：cmd/ 生命周期脚本与 build.sh 必须在飞牛（Linux）上以 LF 运行，
+# CRLF 会让 bash 报 "bad interpreter" 或语法错误。
+* text=auto eol=lf
+
+*.png binary
+*.fpk binary
