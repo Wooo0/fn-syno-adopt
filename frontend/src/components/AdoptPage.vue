@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onActivated, onMounted, ref } from 'vue'
 import { api, type AdoptPlan, type AdoptedVolume, type Job, type SynoCandidate } from '../api'
 import UiButton from './ui/UiButton.vue'
 import UiCard from './ui/UiCard.vue'
@@ -182,6 +182,23 @@ async function activate(c: SynoCandidate) {
 onMounted(async () => {
   await load(false)
   await loadAdopted()
+})
+
+// KeepAlive 缓存后 onMounted 只在首次挂载跑一次。切回本页必须主动刷新，
+// 否则会看到缓存时的旧候选列表——最典型的场景：用户在检测页点「组装阵列」
+// 后经行动条跳进来，若没有这个钩子，看到的是"未发现群晖候选盘"的空白页。
+// 只在空闲时刷新，避免与队列推进时的刷新打架；勾选与作业状态均保留。
+// 注意：KeepAlive 内首次挂载也会触发 onActivated（在 onMounted 之后），
+// 这里跳过首次，避免和 onMounted 重复拉一次数据。
+let activatedOnce = false
+onActivated(() => {
+  if (!activatedOnce) {
+    activatedOnce = true
+    return
+  }
+  if (running.value || rbRunning.value) return
+  load()
+  loadAdopted()
 })
 </script>
 

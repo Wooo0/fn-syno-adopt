@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onActivated, onMounted, ref } from 'vue'
 import {
   api, type AdoptedVolume, type EaDirScanResult, type Job,
   type OwnerScanResult, type SuggestUser,
@@ -67,6 +67,14 @@ async function scanOwner() {
   } finally {
     ownerScanning.value = false
   }
+}
+
+// 刷接管记录（用于默认路径推断与「最近接管」按钮）；失败不影响手工填路径
+async function refreshAdopted() {
+  try {
+    const res = await api.adopted()
+    adopted.value = res.volumes ?? []
+  } catch { /* 忽略 */ }
 }
 
 // 把最近接管的卷填进路径框（覆盖当前值，作为显式选择被记住）
@@ -169,14 +177,23 @@ onMounted(async () => {
     const s = await api.sysUsers()
     applySuggest(s.suggest)
   } catch { /* 忽略：用户可手填 */ }
-  // 拉接管记录用于默认路径推断（失败不影响手工填路径）
-  try {
-    const res = await api.adopted()
-    adopted.value = res.volumes ?? []
-    // 用户从未手工扫过时（无 localStorage），跟随最近接管的卷
-    if (!localStorage.getItem(LS_KEY_OWNER)) ownerPath.value = defaultPath(LS_KEY_OWNER)
-    if (!localStorage.getItem(LS_KEY_EA)) eaPath.value = defaultPath(LS_KEY_EA)
-  } catch { /* 忽略 */ }
+  await refreshAdopted()
+  // 用户从未手工扫过时（无 localStorage），跟随最近接管的卷
+  if (!localStorage.getItem(LS_KEY_OWNER)) ownerPath.value = defaultPath(LS_KEY_OWNER)
+  if (!localStorage.getItem(LS_KEY_EA)) eaPath.value = defaultPath(LS_KEY_EA)
+})
+
+// KeepAlive 缓存后 onMounted 只跑一次，切回本页刷新接管记录，
+// 保证「最近接管：/volN」按钮指向最新的卷。
+// 不自动改写输入框：用户可能已手工填了路径，改了才是显式选择，由按钮触发。
+// 同上：跳过 KeepAlive 首次挂载那次触发（onMounted 里已经拉过）
+let activatedOnce = false
+onActivated(() => {
+  if (!activatedOnce) {
+    activatedOnce = true
+    return
+  }
+  refreshAdopted()
 })
 </script>
 
