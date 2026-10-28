@@ -27,6 +27,22 @@ func TestMdHealthy(t *testing.T) {
 	}
 }
 
+func TestIsVolPoint(t *testing.T) {
+	cases := map[string]bool{
+		"/vol1":       true,
+		"/vol12":      true,
+		"/vol1/photo": false, // 子目录不是存储空间挂载点
+		"/volume1":    false,
+		"/vol":        false,
+		"/mnt/data":   false,
+	}
+	for in, want := range cases {
+		if got := isVolPoint(in); got != want {
+			t.Errorf("isVolPoint(%q) = %v，期望 %v", in, got, want)
+		}
+	}
+}
+
 func TestStripPartition(t *testing.T) {
 	cases := map[string]string{
 		"/dev/sdd3":       "/dev/sdd",

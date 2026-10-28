@@ -2,7 +2,7 @@
 import { computed, onActivated, onMounted, ref } from 'vue'
 import {
   api, type AdoptedVolume, type EaDirScanResult, type Job,
-  type OwnerScanResult, type SuggestUser,
+  type OwnerScanResult, type SuggestUser, type Volume,
 } from '../api'
 import UiButton from './ui/UiButton.vue'
 import UiCard from './ui/UiCard.vue'
@@ -14,28 +14,35 @@ import DoneCard from './DoneCard.vue'
 type Tab = 'owner' | 'eadir'
 const tab = ref<Tab>('owner')
 
-// —— 默认路径推断 ——
-// /vol1 是飞牛系统卷，写死成默认值会让用户白扫几分钟，甚至对自己的系统卷动 chown。
-// 优先级（显式行为 > 自动推断 > 兜底）：
-//   1. localStorage：用户上一次扫描成功的路径（显式选择，最贴近意图）
-//   2. 最近一条接管记录的 mountPoint（群晖盘一般落在 /vol2+）
-//   3. /vol1
+// —— 目标卷选择 ——
+// 手输 /volN 太容易出错（拼错 / 选成 /vol1 系统卷 / 目录根本不存在），
+// 改成从后端实际挂载的存储空间里下拉选择：看得见容量、看得见是不是刚接管的群晖盘。
+// 优先级：上次选择(localStorage) > 后端推荐(接管盘优先) > /vol1
 const LS_KEY_OWNER = 'fn-syno-adopt.lastPath.owner'
 const LS_KEY_EA = 'fn-syno-adopt.lastPath.eadir'
 
-const adopted = ref<AdoptedVolume[]>([])
-const latestAdopted = computed<AdoptedVolume | null>(() => {
-  if (!adopted.value.length) return null
-  // VolID 最大的即最近接管的卷
-  return adopted.value.reduce((a, b) => (b.volId > a.volId ? b : a))
-})
+const volumes = ref<Volume[]>([])
+const recommend = ref('')
+const manual = ref(false) // 高级用法：手输子目录路径
 
 function defaultPath(lsKey: string): string {
-  const saved = localStorage.getItem(lsKey)
-  if (saved) return saved
-  if (latestAdopted.value?.mountPoint) return latestAdopted.value.mountPoint
-  return '/vol1'
+  return localStorage.getItem(lsKey) || recommend.value || '/vol1'
 }
+
+async function loadVolumes() {
+  try {
+    const res = await api.volumes()
+    volumes.value = res.volumes ?? []
+    recommend.value = res.recommend ?? ''
+  } catch {
+    volumes.value = []
+  }
+}
+
+// 下拉里找不到当前值（比如手输的子目录）时，仍允许提交
+const pathKnown = (p: string) => volumes.value.some((v) => v.path === p)
+
+const adopted = ref<AdoptedVolume[]>([])
 
 // —— 所有权修复 ——
 const ownerPath = ref(defaultPath(LS_KEY_OWNER))
@@ -69,22 +76,12 @@ async function scanOwner() {
   }
 }
 
-// 刷接管记录（用于默认路径推断与「最近接管」按钮）；失败不影响手工填路径
+// 刷接管记录（已接管卷的展示用）；失败不影响选择卷
 async function refreshAdopted() {
   try {
     const res = await api.adopted()
     adopted.value = res.volumes ?? []
   } catch { /* 忽略 */ }
-}
-
-// 把最近接管的卷填进路径框（覆盖当前值，作为显式选择被记住）
-function fillLatest() {
-  const p = latestAdopted.value?.mountPoint
-  if (!p) return
-  ownerPath.value = p
-  eaPath.value = p
-  localStorage.setItem(LS_KEY_OWNER, p)
-  localStorage.setItem(LS_KEY_EA, p)
 }
 
 function applySuggest(s: SuggestUser | null) {
@@ -133,6 +130,10 @@ const eaError = ref('')
 const eaDone = ref(false)
 const eaTrash = ref('') // 清理完成后的回收站路径
 
+// 当前选中卷的元信息（用于显示"群晖接管盘"/"飞牛系统卷"徽标）
+const currentOwnerVol = computed(() => volumes.value.find((v) => v.path === ownerPath.value) ?? null)
+const currentEaVol = computed(() => volumes.value.find((v) => v.path === eaPath.value) ?? null)
+
 const canEaClean = ref(false)
 
 async function scanEa() {
@@ -177,16 +178,16 @@ onMounted(async () => {
     const s = await api.sysUsers()
     applySuggest(s.suggest)
   } catch { /* 忽略：用户可手填 */ }
-  await refreshAdopted()
-  // 用户从未手工扫过时（无 localStorage），跟随最近接管的卷
+  await Promise.all([refreshAdopted(), loadVolumes()])
+  // 卷列表到位后重算默认值：上次选择 > 后端推荐（接管盘优先）> /vol1
   if (!localStorage.getItem(LS_KEY_OWNER)) ownerPath.value = defaultPath(LS_KEY_OWNER)
   if (!localStorage.getItem(LS_KEY_EA)) eaPath.value = defaultPath(LS_KEY_EA)
 })
 
-// KeepAlive 缓存后 onMounted 只跑一次，切回本页刷新接管记录，
-// 保证「最近接管：/volN」按钮指向最新的卷。
-// 不自动改写输入框：用户可能已手工填了路径，改了才是显式选择，由按钮触发。
-// 同上：跳过 KeepAlive 首次挂载那次触发（onMounted 里已经拉过）
+// KeepAlive 缓存后 onMounted 只跑一次，切回本页刷新卷列表与接管记录，
+// 保证刚接管完的卷能立刻出现在下拉里。
+// 不自动改写已选中的路径：用户可能已选过目标，改了才是显式选择。
+// 注意：KeepAlive 首次挂载也会触发 onActivated，这里跳过首次（onMounted 已拉过）
 let activatedOnce = false
 onActivated(() => {
   if (!activatedOnce) {
@@ -194,6 +195,7 @@ onActivated(() => {
     return
   }
   refreshAdopted()
+  loadVolumes()
 })
 </script>
 
@@ -217,12 +219,24 @@ onActivated(() => {
       </template>
 
       <div class="path-row">
-        <input v-model="ownerPath" class="path-input mono" :disabled="ownerRunning" spellcheck="false" />
-        <UiButton v-if="latestAdopted?.mountPoint" variant="ghost" @click="fillLatest">
-          最近接管：{{ latestAdopted.mountPoint }}
-        </UiButton>
+        <template v-if="volumes.length && !manual">
+          <select v-model="ownerPath" class="vol-select mono" :disabled="ownerRunning">
+            <option v-for="v in volumes" :key="v.path" :value="v.path">
+              {{ v.path }} · {{ v.fs || '未知文件系统' }} · {{ v.totalHuman || '—' }}
+              <template v-if="v.usedHuman">（已用 {{ v.usedHuman }}）</template>
+              {{ v.adopted ? '· 群晖接管盘' : v.isSystem ? '· 飞牛系统卷' : '' }}
+            </option>
+          </select>
+          <UiBadge v-if="currentOwnerVol?.adopted" type="ok">群晖接管盘</UiBadge>
+          <UiBadge v-else-if="currentOwnerVol?.isSystem" type="warn">飞牛系统卷，一般不是你要修的盘</UiBadge>
+          <button class="link" @click="manual = true">手动输入子目录</button>
+        </template>
+        <template v-else>
+          <input v-model="ownerPath" class="path-input mono" :disabled="ownerRunning" spellcheck="false" />
+          <button v-if="volumes.length" class="link" @click="manual = false">改从列表选择</button>
+        </template>
         <p class="hint">
-          仅允许 /volN 开头的路径（默认已指向最近接管的卷，/vol1 是飞牛系统卷，一般不是你要修的盘）。
+          下拉里的都是本机实际挂载的存储空间，不会选到不存在的目录。
           大卷扫描可能耗时数分钟：百万级文件约需数分钟，可离开本页，任务在后台继续。
         </p>
       </div>
@@ -267,8 +281,16 @@ onActivated(() => {
           <span class="colon">:</span>
           <input v-model.number="gid" type="number" class="num-input mono" :disabled="ownerRunning" placeholder="gid" />
         </div>
-        <label>路径</label>
-        <input v-model="ownerPath" class="path-input mono" :disabled="ownerRunning" spellcheck="false" />
+        <label>目标卷</label>
+        <div class="vol-cell">
+          <select v-if="volumes.length && !manual" v-model="ownerPath" class="vol-select mono" :disabled="ownerRunning">
+            <option v-for="v in volumes" :key="v.path" :value="v.path">
+              {{ v.path }} · {{ v.totalHuman || '—' }}{{ v.adopted ? ' · 群晖接管盘' : v.isSystem ? ' · 飞牛系统卷' : '' }}
+            </option>
+          </select>
+          <input v-else v-model="ownerPath" class="path-input mono" :disabled="ownerRunning" spellcheck="false" />
+          <span v-if="!pathKnown(ownerPath)" class="warn-inline">⚠ 手输路径，请确认以 /volN 开头且存在</span>
+        </div>
         <label>扩展 ACL</label>
         <label class="check">
           <input v-model="removeAcl" type="checkbox" :disabled="ownerRunning" />
@@ -316,11 +338,21 @@ onActivated(() => {
       </template>
 
       <div class="path-row">
-        <input v-model="eaPath" class="path-input mono" :disabled="eaRunning" spellcheck="false" />
-        <UiButton v-if="latestAdopted?.mountPoint" variant="ghost" @click="fillLatest">
-          最近接管：{{ latestAdopted.mountPoint }}
-        </UiButton>
-        <p class="hint">仅允许 /volN 开头的路径。目录很多时扫描需数分钟，可离开本页，任务在后台继续。</p>
+        <template v-if="volumes.length && !manual">
+          <select v-model="eaPath" class="vol-select mono" :disabled="eaRunning">
+            <option v-for="v in volumes" :key="v.path" :value="v.path">
+              {{ v.path }} · {{ v.totalHuman || '—' }}{{ v.adopted ? ' · 群晖接管盘' : v.isSystem ? ' · 飞牛系统卷' : '' }}
+            </option>
+          </select>
+          <UiBadge v-if="currentEaVol?.adopted" type="ok">群晖接管盘</UiBadge>
+          <UiBadge v-else-if="currentEaVol?.isSystem" type="warn">飞牛系统卷，一般不是你要清的盘</UiBadge>
+          <button class="link" @click="manual = true">手动输入子目录</button>
+        </template>
+        <template v-else>
+          <input v-model="eaPath" class="path-input mono" :disabled="eaRunning" spellcheck="false" />
+          <button v-if="volumes.length" class="link" @click="manual = false">改从列表选择</button>
+        </template>
+        <p class="hint">下拉里都是本机实际挂载的存储空间。目录很多时扫描需数分钟，可离开本页，任务在后台继续。</p>
       </div>
 
       <p v-if="eaError" class="err-text">✗ {{ eaError }}</p>
@@ -345,8 +377,14 @@ onActivated(() => {
         确认无误后在飞牛文件管理器中手动清空即可完成删除；期间随时可原样移回。
       </template>
       <div class="path-row">
-        <label class="form-label">路径</label>
-        <input v-model="eaPath" class="path-input mono" :disabled="eaRunning" spellcheck="false" />
+        <label class="form-label">目标卷</label>
+        <select v-if="volumes.length && !manual" v-model="eaPath" class="vol-select mono" :disabled="eaRunning">
+          <option v-for="v in volumes" :key="v.path" :value="v.path">
+            {{ v.path }} · {{ v.totalHuman || '—' }}{{ v.adopted ? ' · 群晖接管盘' : v.isSystem ? ' · 飞牛系统卷' : '' }}
+          </option>
+        </select>
+        <input v-else v-model="eaPath" class="path-input mono" :disabled="eaRunning" spellcheck="false" />
+        <span v-if="!pathKnown(eaPath)" class="warn-inline">⚠ 手输路径，请确认以 /volN 开头且存在</span>
       </div>
       <div class="exec-btns">
         <UiButton variant="default" :disabled="eaRunning" @click="runEaClean(true)">演练</UiButton>
@@ -394,6 +432,25 @@ onActivated(() => {
 .path-row { margin: 10px 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .path-row .hint { flex-basis: 100%; }
 .form-label { font-size: 13px; color: var(--fui-text-2); margin-right: 8px; }
+.vol-select {
+  border: 1px solid var(--fui-border);
+  border-radius: var(--fui-radius-sm);
+  padding: 6px 10px;
+  font-size: 13px;
+  min-width: 340px;
+  max-width: 100%;
+  background: var(--fui-card);
+  color: var(--fui-text-1);
+}
+.vol-select:focus { outline: none; border-color: var(--fui-primary); }
+.vol-cell { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.warn-inline { font-size: 12px; color: var(--fui-yellow); }
+.link {
+  border: 0; background: transparent; color: var(--fui-primary);
+  font-size: 12px; cursor: pointer; padding: 0; font-family: inherit;
+}
+.link:hover { text-decoration: underline; }
+
 .path-input {
   border: 1px solid var(--fui-border);
   border-radius: var(--fui-radius-sm);

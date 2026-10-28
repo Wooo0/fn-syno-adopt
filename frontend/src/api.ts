@@ -125,6 +125,23 @@ export interface EaDirScanResult {
   truncated: boolean
 }
 
+export interface Volume {
+  path: string
+  device: string
+  vg: string
+  lv: string
+  fs: string
+  total: number
+  used: number
+  avail: number
+  totalHuman: string
+  usedHuman: string
+  adopted: boolean
+  disk: string
+  adoptTime: string
+  isSystem: boolean
+}
+
 export interface SysUsers {
   suggest: SuggestUser | null
   crcLoaded: boolean
@@ -160,6 +177,9 @@ export const api = {
       disks: Disk[] | null
     }>('api/disks'),
   sysUsers: () => get<SysUsers>('api/sysusers'),
+
+  volumes: () =>
+    get<{ ok: boolean; volumes: Volume[] | null; recommend: string }>('api/volumes'),
 
   mdScan: () =>
     get<{ ok: boolean; arrays: string[] | null }>('api/md/scan'),

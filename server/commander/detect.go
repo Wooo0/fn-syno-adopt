@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -176,6 +177,81 @@ func MountPointOf(dev string) string {
 		}
 	}
 	return ""
+}
+
+// VolMount 一个已挂载的存储空间挂载点（/volN）。
+type VolMount struct {
+	Point  string // /vol3
+	Device string // /dev/mapper/trim_xxx-0
+	FSType string // btrfs
+}
+
+// VolMounts 返回当前系统里所有已挂载的 /volN 存储空间（只读）。
+// 清理工具的路径选择只应该在这些里面挑——没挂载的目录根本扫不了。
+func VolMounts() []VolMount {
+	b, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		return nil
+	}
+	var out []VolMount
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		mp := strings.ReplaceAll(f[1], "\\040", " ")
+		if !isVolPoint(mp) {
+			continue
+		}
+		out = append(out, VolMount{Point: mp, Device: f[0], FSType: f[2]})
+	}
+	return out
+}
+
+// isVolPoint 判断是否为 /volN 形式的挂载点（N 为 1-2 位数字，且不是 /volN/子路径）。
+func isVolPoint(mp string) bool {
+	if len(mp) < 5 || !strings.HasPrefix(mp, "/vol") {
+		return false
+	}
+	for _, c := range mp[4:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// DfUsage 查询一个路径的容量（字节）。用 POSIX 格式解析，避免换行拆分。
+func DfUsage(path string) (total, used, avail int64, err error) {
+	r, err := Run(15*time.Second, "df", "-B1", "-P", path)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	lines := strings.Split(strings.TrimSpace(r.Stdout), "\n")
+	if len(lines) < 2 {
+		return 0, 0, 0, fmt.Errorf("df 输出无法解析: %q", r.Stdout)
+	}
+	f := strings.Fields(lines[len(lines)-1])
+	if len(f) < 4 {
+		return 0, 0, 0, fmt.Errorf("df 输出字段不足: %q", lines[len(lines)-1])
+	}
+	total, _ = strconv.ParseInt(f[1], 10, 64)
+	used, _ = strconv.ParseInt(f[2], 10, 64)
+	avail, _ = strconv.ParseInt(f[3], 10, 64)
+	return total, used, avail, nil
+}
+
+// SameDevice 判断两个设备路径是否指向同一个设备（/dev/mapper/x 与 /dev/dm-N 视为相同）。
+func SameDevice(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	ra, e1 := filepath.EvalSymlinks(a)
+	rb, e2 := filepath.EvalSymlinks(b)
+	return e1 == nil && e2 == nil && ra == rb
 }
 
 // MdMembers 返回 md 阵列的成员分区路径（mdadm --detail）。

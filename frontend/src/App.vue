@@ -9,7 +9,7 @@ import UiSidebar, { type SidebarItem } from './components/ui/UiSidebar.vue'
 import AdoptPage from './components/AdoptPage.vue'
 import CleanPage from './components/CleanPage.vue'
 
-const APP_VERSION = 'v0.5.3'
+const APP_VERSION = 'v0.5.4'
 
 const sys = ref<SystemInfo | null>(null)
 const candidates = ref<SynoCandidate[]>([])

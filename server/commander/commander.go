@@ -48,6 +48,7 @@ var allowedBinaries = map[string]bool{
 	"pg_dump":     true,
 	"psql":        true,
 	"du":          true,
+	"df":          true,
 	"find":        true,
 	"mv":          true,
 	// sudo 仅允许固定形态：sudo -u postgres psql/pg_dump ...（飞牛 PostgreSQL 本机 peer 认证）

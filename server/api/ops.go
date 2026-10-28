@@ -15,6 +15,7 @@ import (
 	"fnos-syno-adopt/eadir"
 	"fnos-syno-adopt/jobs"
 	"fnos-syno-adopt/owner"
+	"fnos-syno-adopt/vols"
 )
 
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -261,6 +262,21 @@ func rollbackHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "jobId": job.ID})
 }
 
+// ---------- 可选存储空间（清理工具下拉用） ----------
+
+func volumesHandler(w http.ResponseWriter, _ *http.Request) {
+	list, err := vols.List()
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"ok":        true,
+		"volumes":   list,
+		"recommend": vols.Recommend(list),
+	})
+}
+
 // ---------- 任务查询 ----------
 
 func jobsListHandler(w http.ResponseWriter, _ *http.Request) {
@@ -319,4 +335,5 @@ func RegisterOps(mux *http.ServeMux) {
 	mux.HandleFunc("/api/jobs", jobsListHandler)
 	mux.HandleFunc("/api/jobs/", jobGetHandler)
 	mux.HandleFunc("/api/sysusers", sysUsersHandler)
+	mux.HandleFunc("/api/volumes", volumesHandler)
 }
