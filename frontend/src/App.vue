@@ -259,8 +259,12 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
-      <AdoptPage v-else-if="page === 'adopt'" />
-      <CleanPage v-else-if="page === 'clean'" />
+      <!-- KeepAlive：页面切走时保留组件状态（jobId/运行视图/任务日志），
+           否则 v-if 卸载后"切回来自动续轮询"不成立，侧栏"进行中·查看"也会落空 -->
+      <KeepAlive>
+        <AdoptPage v-if="page === 'adopt'" />
+        <CleanPage v-else-if="page === 'clean'" />
+      </KeepAlive>
     </main>
   </div>
 </template>
