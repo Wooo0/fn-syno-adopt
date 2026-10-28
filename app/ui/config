@@ -1,0 +1,17 @@
+{
+    ".url": {
+        "fn-syno-adopt.Application": {
+            "title": "群晖迁移助手",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/fn-syno-adopt",
+            "gatewaySocket": "app.sock",
+            "url": "/app/fn-syno-adopt",
+            "allUsers": false,
+            "control": {
+                "accessPerm": "readonly"
+            }
+        }
+    }
+}

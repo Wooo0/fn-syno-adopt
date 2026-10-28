@@ -1,0 +1,45 @@
+/* ============================================================
+ * 设计令牌（Design Tokens）—— 全项目唯一样式事实源
+ *
+ * 基准：fnOS 官方 UI 变量（github fnproject/ui client/css/variables.css）
+ *       + 参考截图 mi-d.cn/12090（TAD6S4N 模块，fnOS 第三方应用标杆观感）
+ *
+ * 页面/组件禁止硬编码颜色与字体，一律引用这里的变量。
+ * 将来接入成熟组件库时，只需调整本文件与 src/components/ui/ 的内部实现。
+ * ============================================================ */
+:root {
+  /* 主色：参考截图观感的亮蓝（fnOS 官方 primary #0072A5 偏暗，见 --fui-primary-official） */
+  --fui-primary: #2563EB;
+  --fui-primary-hover: #1D4FD7;
+  --fui-primary-official: #0072A5;
+  --fui-accent: #FCB104;
+
+  /* 文字梯度 */
+  --fui-text-1: rgba(58, 68, 82, 0.87);
+  --fui-text-2: rgba(58, 68, 82, 0.5);
+  --fui-text-disabled: rgba(58, 68, 82, 0.3);
+
+  /* 边框与背景 */
+  --fui-divider: rgba(58, 68, 82, 0.08);
+  --fui-border: #E5E7EB;
+  --fui-grey: #D2D6DE;
+  --fui-bg: #F2F3F5;         /* 窗口底：灰（侧栏同色） */
+  --fui-content: #FFF;       /* 内容面板：白色圆角浮动板 */
+  --fui-panel: #F7F8FA;      /* 信息条/内嵌卡片：浅灰圆角块 */
+  --fui-card: #FFF;
+
+  /* 语义色 */
+  --fui-green: #00A757;
+  --fui-red: #DC2626;
+  --fui-yellow: #F59D00;
+  --fui-blue: #378CBE;
+  --fui-danger-bg: rgba(220, 38, 38, 0.08);
+
+  /* 字体 */
+  --fui-font: 'Open Sans', 'PingFang SC', 'Microsoft YaHei', Helvetica, Arial, sans-serif;
+  --fui-font-mono: 'SF Mono', Consolas, monospace;
+
+  /* 圆角 */
+  --fui-radius: 12px;
+  --fui-radius-sm: 6px;
+}

@@ -1,0 +1,8 @@
+#!/bin/bash
+# 卸载时停止应用进程
+APP_PIDFILE="${TRIM_PKGVAR}/app.pid"
+if [ -f "$APP_PIDFILE" ]; then
+  kill "$(cat "$APP_PIDFILE")" 2>/dev/null
+  rm -f "$APP_PIDFILE"
+fi
+exit 0

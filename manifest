@@ -1,0 +1,15 @@
+appname               = fn-syno-adopt
+version               = 0.5.0
+display_name          = 群晖迁移助手
+desc                  = 检测并零拷贝接管群晖硬盘为飞牛原生存储空间，含所有权修复、@eaDir 清理与一键回滚
+platform              = x86
+ctl_stop              = true
+source                = thirdparty
+maintainer            = kou
+distributor           = kou
+desktop_uidir         = ui
+desktop_applaunchname = fn-syno-adopt.Application
+
+# platform = x86：后端由 build.sh 交叉编译为 linux/amd64（GOARCH=amd64），
+# 未构建 ARM 产物，因此 ARM 机型（部分飞牛盒子）暂不支持。
+# 后续要支持 ARM：build.sh 增加 arm64 产物 + 此处按 fnpack schema 补架构。

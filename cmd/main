@@ -1,0 +1,48 @@
+#!/bin/bash
+# fn-syno-adopt 生命周期入口: start / stop / status
+# 统一网关模式：二进制读取 TRIM_APPDEST 自行监听 ${TRIM_APPDEST}/app.sock，无需端口参数
+APP_BIN="${TRIM_APPDEST}/server/fn-syno-adopt"
+PIDFILE="${TRIM_PKGVAR}/app.pid"
+LOGFILE="${TRIM_PKGVAR}/app.log"
+
+is_running() {
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+case "$1" in
+  start)
+    if is_running; then exit 0; fi
+    if [ ! -x "$APP_BIN" ]; then
+      echo "binary not found: $APP_BIN" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+      exit 1
+    fi
+    mkdir -p "$(dirname "$PIDFILE")" "$(dirname "$LOGFILE")"
+    nohup "$APP_BIN" >> "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 1
+    if ! is_running; then
+      echo "server failed to start, see $LOGFILE" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+      exit 1
+    fi
+    # 等待 socket 就绪（最多 5s），供网关立即转发
+    for i in $(seq 1 10); do
+      [ -S "${TRIM_APPDEST}/app.sock" ] && break
+      sleep 0.5
+    done
+    exit 0
+    ;;
+  stop)
+    if is_running; then
+      kill "$(cat "$PIDFILE")" 2>/dev/null
+      sleep 1
+    fi
+    rm -f "$PIDFILE"
+    exit 0
+    ;;
+  status)
+    if is_running; then exit 0; else exit 3; fi
+    ;;
+  *)
+    exit 1
+    ;;
+esac

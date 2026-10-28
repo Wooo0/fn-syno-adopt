@@ -1,0 +1,7 @@
+{
+  "defaults": {
+    "run-as": "root"
+  },
+  "username": "fn_syno_adopt",
+  "groupname": "fn_syno_adopt"
+}
