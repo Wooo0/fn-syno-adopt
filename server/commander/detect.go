@@ -185,6 +185,16 @@ func VGs() ([]VGInfo, error) {
 	return out, nil
 }
 
+// DevSize 查询单个设备的容量（lsblk 的 JSON 是树形的，md 之类嵌在 children 里，
+// 顶层 BlockDevices 拿不到，只能单独问一次）。
+func DevSize(dev string) string {
+	r, err := Run(10*time.Second, "lsblk", "-dn", "-o", "SIZE", dev)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(r.Stdout)
+}
+
 // AllPVs 返回当前全部物理卷路径（用来判断某个 md 阵列有没有被 LVM 用掉）。
 func AllPVs() []string {
 	r, err := Run(10*time.Second, "pvs", "--noheadings", "-o", "pv_name")
@@ -450,9 +460,15 @@ func BtrfsSubvolsViaMount(dev string) ([]BtrfsSubvol, error) {
 	}
 	defer os.Remove(dir) // 卸载后目录为空，可以删掉
 
-	if r, err := Run(30*time.Second, "mount", "-o", "ro,subvolid=5", dev, dir); err != nil {
-		return nil, fmt.Errorf("只读挂载 %s 失败（stderr: %s）: %w",
-			dev, strings.TrimSpace(r.Stderr), err)
+	// btrfs 多设备文件系统必须先让内核注册设备，否则单独挂其中一个会报
+	// "can't read superblock"。scan 是幂等的，失败也不影响后续尝试。
+	Run(30*time.Second, "btrfs", "device", "scan", dev)
+
+	// 必须带 -t btrfs：不指定的话 mount 会自己探测所有 fs 类型，失败时只给一句
+	// "can't read superblock"，真正的 btrfs 报错被吞掉，排查无从下手。
+	if r, err := Run(30*time.Second, "mount", "-t", "btrfs", "-o", "ro,subvolid=5", dev, dir); err != nil {
+		return nil, fmt.Errorf("只读挂载 %s 失败（exit=%d｜stderr=%s）: %w",
+			dev, r.ExitCode, strings.TrimSpace(r.Stderr), err)
 	}
 	defer func() {
 		// 务必卸载：残留挂载会让后续接管失败，也会挡住磁盘弹出
@@ -884,7 +900,7 @@ func detectDirectBtrfs(disks []BlockDevice, existing []SynoCandidate) []SynoCand
 			LV:        "—",
 			DMPath:    md,
 			MdDev:     md,
-			LVSize:    sizeOf[md],
+			LVSize:    DevSize(md), // lsblk 树形输出里没有 md，必须单独查
 			FS:        fs,
 			DevReady:  true, // md 阵列本身就是块设备
 			Kind:      KindDirect,

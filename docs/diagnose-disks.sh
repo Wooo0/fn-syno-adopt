@@ -125,3 +125,28 @@ lsmod 2>/dev/null | grep -w btrfs || echo "btrfs 内核模块未加载：modprob
 echo
 echo "若上面全是『失败』，一次激活全部群晖卷组（只建设备映射，不动数据）："
 echo "  sudo vgchange -ay"
+
+say "11) 子卷读不到的进阶排查（挂载法也失败时看这里）"
+echo "-- 手动复现：带 -t btrfs 挂载，能看到真正的报错（不加 -t 只报 can't read superblock）--"
+for dm in $(lvs --noheadings -o lv_dm_path 2>/dev/null | awk '{print $1}' | grep -v reserved) /dev/md2 /dev/md3; do
+  [ -e "$dm" ] || continue
+  d=$(mktemp -d /tmp/probe-XXXX)
+  btrfs device scan "$dm" >/dev/null 2>&1
+  if mount -t btrfs -o ro,subvolid=5 "$dm" "$d" 2>/tmp/mnt.err; then
+    printf '  ✅ %s 挂载成功，子卷：%s\n' "$dm" "$(btrfs subvolume list "$d" 2>/dev/null | awk '{print $NF}' | tr '\n' ' ')"
+    umount "$d" 2>/dev/null
+  else
+    printf '  ❌ %s 挂载失败：%s\n' "$dm" "$(cat /tmp/mnt.err | head -2 | tr '\n' ' ')"
+  fi
+  rmdir "$d" 2>/dev/null
+done
+echo
+echo "-- 内核最近的相关报错（I/O error / btrfs 报错都在这里）--"
+dmesg 2>/dev/null | tail -40 | grep -iE "btrfs|I/O error|ata|scsi|md[0-9]" || echo "（dmesg 无相关输出或权限不足）"
+echo
+echo "-- 各盘 SMART 健康（出现 Reallocated/Pending/Uncorrectable 就要警惕）--"
+command -v smartctl >/dev/null || { echo "未安装 smartctl：apt install smartmontools"; return 2>/dev/null || exit 0; }
+for d in sda sdb sdc sdd sde sdf sdg; do
+  [ -b "/dev/$d" ] || continue
+  printf '%-4s %s\n' "/dev/$d" "$(smartctl -H "/dev/$d" 2>/dev/null | grep -i 'overall-health' | head -1)"
+done
