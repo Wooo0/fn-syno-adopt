@@ -103,21 +103,25 @@ for m in /dev/mapper/vg*-*; do
   fi
 done
 echo
-echo "-- 每块群晖数据卷实际能不能读子卷（先试 /dev/mapper，失败再试 /dev/dm-N）--"
+echo "-- 每块群晖数据卷实际能不能读子卷（必须走挂载法，块设备法在 v6.2 上必失败）--"
 lvs --noheadings -o vg_name,lv_name,lv_dm_path 2>/dev/null | while read -r vg lv dm; do
   case "$lv" in syno_vg_reserved_area) continue;; esac
   case "$vg" in trim_*) continue;; esac
-  if btrfs subvolume list "$dm" >/dev/null 2>&1; then
-    printf '  ✅ %s/%s  mapper 路径可读\n' "$vg" "$lv"
-    continue
-  fi
-  real=$(readlink -f "$dm" 2>/dev/null)
-  if [ -n "$real" ] && [ "$real" != "$dm" ] && btrfs subvolume list "$real" >/dev/null 2>&1; then
-    printf '  ⚠️  %s/%s  mapper 读不了，但 %s 可以（应改用真实节点）\n' "$vg" "$lv" "$real"
+  d=$(mktemp -d /tmp/probe10-XXXX)
+  btrfs device scan "$dm" >/dev/null 2>&1
+  if mount -t btrfs -o ro,subvolid=5 "$dm" "$d" 2>/dev/null; then
+    printf '  ✅ %s/%s 正常挂载，子卷：%s\n' "$vg" "$lv" \
+      "$(btrfs subvolume list "$d" 2>/dev/null | awk '{print $NF}' | tr '\n' ' ')"
+    umount "$d" 2>/dev/null
+  elif mount -t btrfs -o ro,usebackuproot,subvolid=5 "$dm" "$d" 2>/dev/null; then
+    printf '  ⚠️  %s/%s **主树根损坏**，靠备份树根才挂上，子卷：%s\n' "$vg" "$lv" \
+      "$(btrfs subvolume list "$d" 2>/dev/null | awk '{print $NF}' | tr '\n' ' ')"
+    umount "$d" 2>/dev/null
   else
-    printf '  ❌ %s/%s  两条路径都读不了，最后一条报错：\n' "$vg" "$lv"
-    btrfs subvolume list "$dm" 2>&1 | head -3 | sed 's/^/        /'
+    printf '  ❌ %s/%s 挂载失败：%s\n' "$vg" "$lv" \
+      "$(mount -t btrfs -o ro,subvolid=5 "$dm" "$d" 2>&1 | head -1)"
   fi
+  rmdir "$d" 2>/dev/null
 done
 echo
 echo "-- 内核 btrfs 模块（subvolume list 走 ioctl，模块没加载会失败）--"

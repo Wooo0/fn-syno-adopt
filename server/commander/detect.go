@@ -445,6 +445,7 @@ func BtrfsSubvolIDsErr(dev string) ([]BtrfsSubvol, error) {
 }
 
 // BtrfsSubvolsViaMount 只读挂载 btrfs 的 FS tree 后列出子卷。
+// 第二个返回值表示是否动用了备份树根（说明该文件系统树根有损坏）。
 //
 // 真机实测（fnOS + btrfs-progs v6.2）：直接对块设备执行
 // `btrfs subvolume list /dev/dm-N` 会报 "ERROR: not a directory / can't access"，
@@ -453,22 +454,37 @@ func BtrfsSubvolIDsErr(dev string) ([]BtrfsSubvol, error) {
 //
 // 必须挂 subvolid=5（FS tree）而不是默认子卷：群晖把 default 设成 @syno，
 // 挂默认子卷只能看到 @syno 内部，列不出 @syno 本身。
-func BtrfsSubvolsViaMount(dev string) ([]BtrfsSubvol, error) {
+// BtrfsSubvolsViaMount 只读挂载 btrfs 的 FS tree 后列出子卷。
+// 第二个返回值表示是否动用了备份树根（说明该文件系统树根有损坏）。
+func BtrfsSubvolsViaMount(dev string) ([]BtrfsSubvol, bool, error) {
 	dir, err := os.MkdirTemp("", "fn-syno-probe-")
 	if err != nil {
-		return nil, fmt.Errorf("创建临时挂载点失败: %w", err)
+		return nil, false, fmt.Errorf("创建临时挂载点失败: %w", err)
 	}
 	defer os.Remove(dir) // 卸载后目录为空，可以删掉
 
+	rescued := false
 	// btrfs 多设备文件系统必须先让内核注册设备，否则单独挂其中一个会报
 	// "can't read superblock"。scan 是幂等的，失败也不影响后续尝试。
 	Run(30*time.Second, "btrfs", "device", "scan", dev)
 
 	// 必须带 -t btrfs：不指定的话 mount 会自己探测所有 fs 类型，失败时只给一句
 	// "can't read superblock"，真正的 btrfs 报错被吞掉，排查无从下手。
-	if r, err := Run(30*time.Second, "mount", "-t", "btrfs", "-o", "ro,subvolid=5", dev, dir); err != nil {
-		return nil, fmt.Errorf("只读挂载 %s 失败（exit=%d｜stderr=%s）: %w",
-			dev, r.ExitCode, strings.TrimSpace(r.Stderr), err)
+	r, err := Run(30*time.Second, "mount", "-t", "btrfs", "-o", "ro,subvolid=5", dev, dir)
+	if err != nil {
+		// 树根损坏时（真机实测：corrupt leaf / couldn't read tree root / open_ctree failed）
+		// 用备份 root 再试一次——飞牛官方的恢复挂载命令用的也是 usebackuproot。
+		// 只读 + 不改盘，安全。
+		r2, err2 := Run(30*time.Second, "mount", "-t", "btrfs",
+			"-o", "ro,usebackuproot,subvolid=5", dev, dir)
+		if err2 != nil {
+			return nil, false, fmt.Errorf("只读挂载 %s 失败（exit=%d｜stderr=%s）；"+
+				"用备份树根重试也失败（exit=%d｜stderr=%s）：该 btrfs 树根已损坏，"+
+				"建议先备份数据再修（btrfs check --readonly）",
+				dev, r.ExitCode, strings.TrimSpace(r.Stderr),
+				r2.ExitCode, strings.TrimSpace(r2.Stderr))
+		}
+		rescued = true
 	}
 	defer func() {
 		// 务必卸载：残留挂载会让后续接管失败，也会挡住磁盘弹出
@@ -476,14 +492,18 @@ func BtrfsSubvolsViaMount(dev string) ([]BtrfsSubvol, error) {
 			Run(30*time.Second, "umount", "-l", dir) // 惰性卸载兜底
 		}
 	}()
-	return BtrfsSubvolIDsErr(dir)
+	subs, err := BtrfsSubvolIDsErr(dir)
+	return subs, rescued, err
 }
 
 // BtrfsSubvolsAuto 先用挂载法读子卷（v6.2 上唯一可行），读不到再退回块设备法。
-// 返回子卷、实际用的方式、以及两种都失败时的错误。
+// 返回子卷、实际用的方式（mount / mount-backuproot / dev）、以及都失败时的错误。
 func BtrfsSubvolsAuto(dev string) ([]BtrfsSubvol, string, error) {
-	subs, err := BtrfsSubvolsViaMount(dev)
+	subs, rescued, err := BtrfsSubvolsViaMount(dev)
 	if err == nil {
+		if rescued {
+			return subs, "mount-backuproot", nil
+		}
 		return subs, "mount", nil
 	}
 	mErr := err
@@ -823,7 +843,11 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 				if err != nil {
 					c.Notes = append(c.Notes, "未读到 btrfs 子卷："+err.Error())
 				} else {
-					if via == "mount" {
+					if via == "mount-backuproot" {
+						c.Notes = append(c.Notes,
+							"⚠ 该 btrfs 的**主树根已损坏**，本次是用备份树根（usebackuproot）挂载才读到子卷。"+
+								"数据可能不完整，接管前请先自行备份重要文件")
+					} else if via == "mount" {
 						c.Notes = append(c.Notes,
 							"已通过只读挂载（subvolid=5）读取子卷：btrfs-progs v6.2 不支持直接对块设备执行 subvolume list")
 					}
