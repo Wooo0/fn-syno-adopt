@@ -1,5 +1,5 @@
 appname               = fn-syno-adopt
-version               = 0.5.5
+version               = 0.5.6
 display_name          = 群晖迁移助手
 desc                  = 检测并零拷贝接管群晖硬盘为飞牛原生存储空间，含所有权修复、@eaDir 清理与一键回滚
 platform              = x86
