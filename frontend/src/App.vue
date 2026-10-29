@@ -184,8 +184,8 @@ onBeforeUnmount(() => {
           </template>
 
           <UiEmpty v-if="candidates.length === 0 && mdArrays.length === 0 && !allAdopted">
-            未发现群晖特征卷（vg1/volume_1）
-            <template #hint>请确认群晖盘已接入本机，且 mdadm 阵列已组装</template>
+            未发现群晖特征卷（vgN/volume_N 或 vgN/lv）
+            <template #hint>请确认群晖盘已接入本机；若盘是 md 阵列，需先组装（mdadm --assemble --scan）</template>
           </UiEmpty>
 
           <!-- 接管成功后盘"消失"的解释：不是失败，是已经接管完成 -->
@@ -193,7 +193,7 @@ onBeforeUnmount(() => {
             <p class="adopted-title">✓ 你的群晖盘已经接管完成，这里不再列出是正常现象</p>
             <p class="adopted-desc">
               接管后卷组会改名为飞牛约定的 trim_xxx 并挂载到 /volN，检测面板只找群晖原样的
-              vg1/volume_1，所以候选列表为空。
+              vgN/volume_N / vgN/lv，所以候选列表为空。
             </p>
             <div v-for="v in adopted" :key="v.vgUuid" class="adopted-item mono">
               {{ v.vg }} → {{ v.mountPoint || '（未挂载）' }}
@@ -205,8 +205,19 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <div v-else-if="candidates.length === 0" class="md-panel">
-            <p class="md-title">检测到 {{ mdArrays.length }} 个群晖 mdadm 阵列特征，但尚未组装</p>
+          <!-- 未组装阵列提示：不能只在"候选为 0"时显示。
+               真机上常见 5 个可见 + 2 个藏在未组装阵列里，此时候选非空，
+               旧写法（candidates.length === 0）会把这条唯一的补救入口压掉，
+               用户只会觉得"少了盘"，却看不到原因和解法。 -->
+          <div v-if="mdArrays.length > 0" class="md-panel">
+            <p class="md-title">
+              <template v-if="candidates.length">
+                还有 {{ mdArrays.length }} 个 mdadm 阵列未组装 —— 这些盘现在不会出现在下面的列表里
+              </template>
+              <template v-else>
+                检测到 {{ mdArrays.length }} 个群晖 mdadm 阵列特征，但尚未组装
+              </template>
+            </p>
             <p class="hint">群晖阵列使用 1.2 超级块，系统不会自动组装，因此看不到卷。组装是只读性质的激活操作（不改数据），点击后自动重新检测。</p>
             <div class="md-list mono">
               <div v-for="a in mdArrays" :key="a">{{ a }}</div>
@@ -217,7 +228,7 @@ onBeforeUnmount(() => {
             </UiButton>
           </div>
 
-          <table v-else>
+          <table v-if="candidates.length > 0">
             <thead>
               <tr>
                 <th>类型</th><th>物理盘</th><th>型号</th><th>卷</th><th>大小</th>
