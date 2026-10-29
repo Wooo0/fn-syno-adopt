@@ -74,7 +74,19 @@ for md in $(ls /sys/block 2>/dev/null | grep '^md' | sort -V); do
     case "$fs" in
       btrfs)
         echo "       ↳ btrfs 直接建在阵列上（没有 LVM 层），当前版本不支持接管"
-        btrfs subvolume list "$dev" 2>&1 | head -5 | sed 's/^/       /'
+        # 必须用挂载法：v6.2 对块设备执行 subvolume list 会报 "not a directory"，
+        # 那是命令的用法问题，不是盘坏了——早期版本在这里直接打出来，纯属误导。
+        d=$(mktemp -d /tmp/probe8-XXXX)
+        if mount -t btrfs -o ro,subvolid=5 "$dev" "$d" 2>/dev/null; then
+          echo "       子卷：$(btrfs subvolume list "$d" 2>/dev/null | awk '{print $NF}' | tr '\n' ' ')"
+          umount "$d" 2>/dev/null
+        elif mount -t btrfs -o ro,usebackuproot,subvolid=5 "$dev" "$d" 2>/dev/null; then
+          echo "       ⚠️ 主树根损坏，靠备份树根挂上：$(btrfs subvolume list "$d" 2>/dev/null | awk '{print $NF}' | tr '\n' ' ')"
+          umount "$d" 2>/dev/null
+        else
+          echo "       ❌ 只读挂载失败（btrfs 树根损坏），详见第 11 节"
+        fi
+        rmdir "$d" 2>/dev/null
         ;;
       ext4) echo "       ↳ ext4 直接建在阵列上（没有 LVM 层）" ;;
     esac
