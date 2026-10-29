@@ -16,6 +16,7 @@ export interface SynoCandidate {
   dmPath: string
   lvSize: string
   lvActive: boolean
+  devReady: boolean         // 设备节点是否可用（卷组已激活）——读不到就不能算可接管
   fs: string
   subvols: string[] | null   // 后端保证非 null，前端仍做兼容
   adoptable: boolean

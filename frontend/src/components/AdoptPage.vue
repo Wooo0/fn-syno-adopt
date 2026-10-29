@@ -251,14 +251,15 @@ onActivated(() => {
               <td>{{ c.lvSize }}</td>
               <td>{{ c.fs || '未知' }}</td>
               <td>
-                <UiBadge :type="c.adoptable ? 'ok' : 'warn'">
-                  {{ c.adoptable ? '可接管' : '不满足' }}
-                </UiBadge>
+                <UiBadge v-if="c.adoptable" type="ok">可接管</UiBadge>
+                <UiBadge v-else-if="c.devReady === false" type="err">需激活</UiBadge>
+                <UiBadge v-else type="warn">不满足</UiBadge>
               </td>
               <td>
-                <!-- 未激活就用不了（读不到文件系统与子卷）：不管是否可接管都给激活入口 -->
+                <!-- 未激活就用不了（读不到文件系统与子卷）：不管是否可接管都给激活入口。
+                     用 devReady 判断而非 lvActive：lvs 的激活位在真机上未必可信 -->
                 <UiButton
-                  v-if="!c.lvActive" variant="ghost"
+                  v-if="c.devReady === false" variant="ghost"
                   :disabled="running" @click="activate(c)"
                 >激活卷组</UiButton>
               </td>

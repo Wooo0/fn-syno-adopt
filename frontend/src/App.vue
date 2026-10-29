@@ -253,9 +253,10 @@ onBeforeUnmount(() => {
                   <td>{{ c.lvSize }}</td>
                   <td>{{ c.fs || '未知' }}</td>
                   <td>
-                    <UiBadge :type="c.adoptable ? 'ok' : 'warn'">
-                      {{ c.adoptable ? '可接管' : '不满足' }}
-                    </UiBadge>
+                    <!-- 设备读不到时不能显示"可接管"：那会让用户点了接管才失败 -->
+                    <UiBadge v-if="c.adoptable" type="ok">可接管</UiBadge>
+                    <UiBadge v-else-if="c.devReady === false" type="err">需激活</UiBadge>
+                    <UiBadge v-else type="warn">不满足</UiBadge>
                   </td>
                 </tr>
                 <tr v-if="c.kind === 'raid'">

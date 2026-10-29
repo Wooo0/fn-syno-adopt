@@ -64,3 +64,25 @@ echo "  ↑ 有输出 = 这些分区上有群晖元数据但没成为 PV（md �
 
 say "9) LVM 扫描状态（这一步会刷新缓存，只读，安全）"
 vgscan 2>&1 | tail -20
+
+say "10) btrfs 子卷读不到的三类根因（界面报 not a directory / can't access 时看这里）"
+echo "-- btrfs-progs 是否装了、版本多少 --"
+command -v btrfs >/dev/null && btrfs --version || echo "btrfs 命令不存在 → 系统缺 btrfs-progs"
+echo
+echo "-- 群晖卷的设备节点到底在不在（关键）--"
+for m in /dev/mapper/vg*-*; do
+  [ -e "$m" ] || continue
+  case "$m" in *syno_vg_reserved_area*) continue;; esac
+  printf '%s -> %s  [%s]\n' "$m" "$(readlink -f "$m")" "$(stat -c '%F' "$m" 2>/dev/null || echo '节点不可访问')"
+done
+echo
+echo "-- 每块群晖数据卷实际能不能读子卷 --"
+lvs --noheadings -o vg_name,lv_name,lv_dm_path 2>/dev/null | while read -r vg lv dm; do
+  case "$lv" in syno_vg_reserved_area) continue;; esac
+  case "$vg" in trim_*) continue;; esac
+  printf '%s/%s (%s): ' "$vg" "$lv" "$dm"
+  btrfs subvolume list "$dm" >/dev/null 2>&1 && echo "OK" || echo "失败 ← 卷组未激活或节点缺失"
+done
+echo
+echo "若上面全是『失败』，一次激活全部群晖卷组（只建设备映射，不动数据）："
+echo "  sudo vgchange -ay"

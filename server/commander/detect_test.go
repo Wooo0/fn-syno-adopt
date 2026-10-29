@@ -1,6 +1,9 @@
 package commander
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 // GLM 的验收标准之一：degraded / recovering / resyncing 的阵列必须被拦截。
 // 这里固化判定规则（纯函数，不依赖 mdadm）。
@@ -81,5 +84,42 @@ func TestStripPartition(t *testing.T) {
 		if got := stripPartition(in); got != want {
 			t.Errorf("stripPartition(%q) = %q，期望 %q", in, got, want)
 		}
+	}
+}
+
+// TestResolveBlockDev 固化"卷组未激活时设备节点不可用"的判定。
+// 真机坑：lvs 给的 /dev/mapper/vgN-lv 在未激活时不是可用块设备，
+// 直接喂给 btrfs 会报 "not a directory / can't access"。
+func TestResolveBlockDev(t *testing.T) {
+	// 一个肯定不存在的路径：必须判定为不可用并给出原因
+	if p, why := ResolveBlockDev("/dev/mapper/definitely-not-exist-0", "vg1", "lv"); p != "" || why == "" {
+		t.Errorf("不存在的设备应返回空路径+原因，实际 p=%q why=%q", p, why)
+	}
+	// 目录不是块设备：必须拒绝（否则 btrfs 会拿它当挂载点，读到的是系统盘）
+	if p, _ := ResolveBlockDev(t.TempDir(), "vg1", "lv"); p != "" {
+		t.Errorf("目录不应被当作块设备，实际返回 %q", p)
+	}
+	// 字符设备（/dev/null）也不是块设备
+	if p, _ := ResolveBlockDev("/dev/null", "vg1", "lv"); p != "" {
+		t.Errorf("/dev/null 是字符设备，不应通过，实际返回 %q", p)
+	}
+	// 真实块设备应原样返回（/dev/loop0 或无该设备时跳过，保证测试在 CI 也能过）
+	if b, err := os.Stat("/dev/loop0"); err == nil && isBlockDevMode(b.Mode()) {
+		if p, _ := ResolveBlockDev("/dev/loop0", "vg1", "lv"); p != "/dev/loop0" {
+			t.Errorf("真实块设备应原样返回，实际 %q", p)
+		}
+	}
+}
+
+func TestIsBlockDevMode(t *testing.T) {
+	dir, err := os.Stat(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isBlockDevMode(dir.Mode()) {
+		t.Error("目录不应判定为块设备")
+	}
+	if nul, err := os.Stat("/dev/null"); err == nil && isBlockDevMode(nul.Mode()) {
+		t.Error("/dev/null 是字符设备，不应判定为块设备")
 	}
 }

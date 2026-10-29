@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -51,6 +52,7 @@ type SynoCandidate struct {
 	DMPath    string   `json:"dmPath"`
 	LVSize    string   `json:"lvSize"`
 	LVActive  bool     `json:"lvActive"`
+	DevReady  bool     `json:"devReady"` // 设备节点是否确实可用（卷组已激活、节点是块设备）
 	FS        string   `json:"fs"`
 	Subvols   []string `json:"subvols"`
 	Adoptable bool     `json:"adoptable"` // 满足接管前置条件（vg1/volume_1 + btrfs + 单盘）
@@ -180,6 +182,53 @@ func VGs() ([]VGInfo, error) {
 		out = append(out, VGInfo{VG: strings.TrimSpace(parts[0]), VGUuid: strings.TrimSpace(parts[1])})
 	}
 	return out, nil
+}
+
+// VGActivate 按 UUID 激活卷组（幂等；已激活的执行也是安全的）。
+// 必须按 UUID 而不是名字：多块群晖盘接进来时卷组全都叫 vg1，名字会歧义。
+func VGActivate(vgUuid string) error {
+	_, err := Run(60*time.Second, "vgchange", "-ay", vgUuid)
+	return err
+}
+
+// isBlockDevMode 判断是否为块设备（排除字符设备：/dev/null 也带 ModeDevice）。
+func isBlockDevMode(m os.FileMode) bool {
+	return m&os.ModeDevice != 0 && m&os.ModeCharDevice == 0
+}
+
+// ResolveBlockDev 把一个 LVM 设备路径解析成**当前确实可用**的块设备路径。
+//
+// 真机坑：lvs 给出的 lv_dm_path 是 /dev/mapper/<vg>-<lv>，但卷组未激活时
+// 这个节点要么不存在、要么是悬空符号链接，btrfs 直接报
+// "not a directory / can't access"。这里依次尝试：
+//  1. 原路径（/dev/mapper/x）
+//  2. 符号链接解析后的真实节点（/dev/dm-N）
+//  3. /dev/<vg>/<lv>
+//
+// 返回一个 stat 确认是块设备的路径；全都不可用时返回原因。
+func ResolveBlockDev(dev, vg, lv string) (string, string) {
+	candidates := []string{dev}
+	if real, err := filepath.EvalSymlinks(dev); err == nil && real != dev {
+		candidates = append(candidates, real)
+	}
+	if vg != "" && lv != "" {
+		candidates = append(candidates, "/dev/"+vg+"/"+lv)
+	}
+	seen := map[string]bool{}
+	for _, p := range candidates {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if st.Mode()&os.ModeDevice != 0 && st.Mode()&os.ModeCharDevice == 0 {
+			return p, ""
+		}
+	}
+	return "", fmt.Sprintf("%s 不是可用块设备（卷组未激活或设备节点缺失）", dev)
 }
 
 // MountPointOf 返回设备当前的挂载点（未挂载返回空串）。
@@ -312,10 +361,28 @@ type BtrfsSubvol struct {
 
 // BtrfsSubvolIDsErr 返回 btrfs 文件系统的子卷列表（含 ID，供 set-default 使用），
 // 并一并返回失败原因——真机上"读不到子卷"是高频问题，必须能把原因暴露给用户。
+//
+// 真机实测的失败有三类，必须先自检再下手，否则只丢一句 exit status 1 给用户：
+//  1. 逻辑卷未激活 → 设备节点不存在（ERROR: not a directory / can't access）
+//  2. 系统没装 btrfs-progs → 找不到 btrfs 命令
+//  3. btrfs-progs 版本太旧 → 群晖 DSM 7.2 默认开 block-group-tree，旧版读不了
 func BtrfsSubvolIDsErr(dev string) ([]BtrfsSubvol, error) {
-	r, err := Run(20*time.Second, "btrfs", "subvolume", "list", dev)
+	if dev == "" {
+		return nil, fmt.Errorf("逻辑卷没有设备节点（lv_dm_path 为空）：卷组可能未激活")
+	}
+	if _, err := exec.LookPath("btrfs"); err != nil {
+		return nil, fmt.Errorf("系统缺少 btrfs-progs（找不到 btrfs 命令）：%v", err)
+	}
+	if st, err := os.Stat(dev); err != nil {
+		return nil, fmt.Errorf("%s 不可访问（%v）：逻辑卷未激活，设备节点缺失", dev, err)
+	} else if !isBlockDevMode(st.Mode()) {
+		return nil, fmt.Errorf("%s 不是块设备（%s）：设备节点异常，请激活卷组后重试", dev, st.Mode().Type())
+	}
+	// 大卷（十几 T）上 subvolume list 可能较慢，超时给足
+	r, err := Run(90*time.Second, "btrfs", "subvolume", "list", dev)
 	if err != nil {
-		return nil, fmt.Errorf("%s（stderr: %s）", err.Error(), strings.TrimSpace(r.Stderr))
+		return nil, fmt.Errorf("btrfs subvolume list %s 失败（exit=%d｜stderr=%s｜%v）",
+			dev, r.ExitCode, strings.TrimSpace(r.Stderr), err)
 	}
 	var subs []BtrfsSubvol
 	for _, line := range strings.Split(r.Stdout, "\n") {
@@ -543,6 +610,8 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 
 	// 初始化为空切片：JSON 序列化为 [] 而非 null（前端契约：列表字段永不为 null）
 	candidates := []SynoCandidate{}
+	// 自动激活过的卷组：同一个 VG 的多个 LV 只激活一次，避免重复跑 vgchange
+	activated := map[string]bool{}
 	for _, lv := range lvs {
 		if strings.HasPrefix(lv.VG, "trim_") {
 			continue // 飞牛原生/已接管卷，跳过
@@ -624,9 +693,33 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 			c.Kind = KindBasic
 		}
 
+		// —— 设备节点可用性 + 自动激活 ——
+		// 真机上 5 块盘全部卡在这里：卷组没激活 → /dev/mapper/vgN-xxx 不是可用块设备 →
+		// btrfs 报 "not a directory / can't access"。让用户自己去点按钮是推卸责任：
+		// 激活只创建 dm 映射、不动数据，检测阶段自动做掉是安全的（幂等）。
+		dev, devErr := ResolveBlockDev(c.DMPath, c.VG, c.LV)
+		if devErr != "" && IsSynoDataVolume(c.VG, c.LV) && !activated[lv.VGUuid] {
+			activated[lv.VGUuid] = true
+			if err := VGActivate(lv.VGUuid); err == nil {
+				c.Notes = append(c.Notes, "已自动激活该卷组（vgchange -ay <UUID>），仅创建设备映射、不改动数据")
+				dev, devErr = ResolveBlockDev(c.DMPath, c.VG, c.LV)
+			} else {
+				c.Notes = append(c.Notes, fmt.Sprintf(
+					"自动激活卷组失败：%v｜请在「磁盘接管」点『激活卷组』，或在 shell 执行：sudo vgchange -ay %s",
+					err, lv.VGUuid))
+			}
+		}
+		c.DevReady = devErr == ""
+		c.DMPath = dev // 换成确实能用的那个路径，后续所有读取都以它为准
+		if devErr != "" {
+			c.Notes = append(c.Notes, devErr)
+		} else {
+			c.LVActive = true // 节点可用即视为已激活，比 lvs 的 attr 位可靠
+		}
+
 		// 子卷：不再要求 LVActive（真机上 lvs 的激活位未必可信，直接试读），
 		// 读不到时把原因写进 notes——否则用户只看到空列表，无从下手。
-		if c.DMPath != "" {
+		if c.DevReady {
 			c.FS = FSType(c.DMPath)
 			if c.FS == "btrfs" {
 				subs, err := BtrfsSubvolIDsErr(c.DMPath)
@@ -634,18 +727,17 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 					c.Subvols = append(c.Subvols, sv.Path)
 				}
 				if err != nil {
-					c.Notes = append(c.Notes,
-						"未读到 btrfs 子卷："+err.Error()+
-							"｜可到「磁盘接管」点『激活卷组』后重新检测")
+					c.Notes = append(c.Notes, "未读到 btrfs 子卷："+err.Error())
 				} else if len(subs) == 0 {
 					c.Notes = append(c.Notes, "该 btrfs 上没有任何子卷（不符合群晖布局，群晖数据卷应有 @syno）")
 				}
 			}
 		}
 
-		// 数据卷判定：认群晖的两种命名，不再写死 vg1/volume_1
+		// 数据卷判定：认群晖的两种命名，不再写死 vg1/volume_1。
+		// 关键：设备读不到就不能标"可接管"——否则用户点了接管才失败，比现在更糟。
 		isData := IsSynoDataVolume(c.VG, c.LV)
-		c.Adoptable = c.FS == "btrfs" && isData && len(physDisks) == 1
+		c.Adoptable = c.DevReady && c.FS == "btrfs" && isData && len(physDisks) == 1
 		if !isData {
 			c.Notes = append(c.Notes, fmt.Sprintf(
 				"%s/%s 不符合群晖数据卷命名（应为 vgN/volume_N 或 vgN/lv），已排除", c.VG, c.LV))
