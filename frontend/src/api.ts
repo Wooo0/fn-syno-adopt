@@ -23,7 +23,8 @@ export interface SynoCandidate {
   notes: string[] | null
 
   // 类型与阵列信息（分类由检测决定）
-  kind: 'basic' | 'raid' | 'unsupported'
+  // basic=单盘(有LVM) raid=阵列(有LVM) direct=btrfs直建在阵列上(无LVM) unsupported=其它
+  kind: 'basic' | 'raid' | 'direct' | 'unsupported'
   mdDev: string
   raidLevel: string
   raidMembers: number

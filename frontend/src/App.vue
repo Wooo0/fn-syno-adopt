@@ -239,23 +239,32 @@ onBeforeUnmount(() => {
               <template v-for="c in candidates" :key="c.dmPath">
                 <tr>
                   <td>
-                    <UiBadge :type="c.kind === 'basic' ? 'info' : c.kind === 'raid' ? 'ok' : 'warn'">
+                    <UiBadge
+                      :type="
+                        c.kind === 'basic' ? 'info'
+                          : c.kind === 'raid' ? 'ok'
+                            : c.kind === 'direct' ? 'info' : 'warn'
+                      "
+                    >
                       {{
                         c.kind === 'raid'
                           ? `${(c.raidLevel || 'RAID').toUpperCase()} ×${c.raidMembers || c.physDisks?.length || '?'}`
-                          : c.kind === 'basic' ? '单盘 Basic' : '不支持'
+                          : c.kind === 'basic' ? '单盘 Basic'
+                            : c.kind === 'direct' ? '直建 btrfs' : '不支持'
                       }}
                     </UiBadge>
                   </td>
                   <td class="mono">{{ (c.physDisks?.length ?? 0) > 1 ? `${c.physDisks?.length} 块` : (c.disk || '未知') }}</td>
                   <td>{{ c.model || '—' }}</td>
-                  <td class="mono">{{ c.vg }}/{{ c.lv }}</td>
+                  <!-- 直建 btrfs 没有卷组/逻辑卷，卷列改显示阵列设备，避免出现「—/—」这种废话 -->
+                  <td class="mono">{{ c.kind === 'direct' ? c.mdDev || c.dmPath : `${c.vg}/${c.lv}` }}</td>
                   <td>{{ c.lvSize }}</td>
                   <td>{{ c.fs || '未知' }}</td>
                   <td>
                     <!-- 设备读不到时不能显示"可接管"：那会让用户点了接管才失败 -->
                     <UiBadge v-if="c.adoptable" type="ok">可接管</UiBadge>
                     <UiBadge v-else-if="c.devReady === false" type="err">需激活</UiBadge>
+                    <UiBadge v-else-if="c.kind === 'direct'" type="info">v0.6 支持</UiBadge>
                     <UiBadge v-else type="warn">不满足</UiBadge>
                   </td>
                 </tr>

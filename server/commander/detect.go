@@ -73,6 +73,7 @@ type SynoCandidate struct {
 const (
 	KindBasic       = "basic"       // 群晖 Basic 单盘：单 PV 且落在单块物理盘上
 	KindRAID        = "raid"        // 单个 md 阵列、成员 ≥2（RAID1/5/6/10）
+	KindDirect      = "direct"      // btrfs 直接建在 md 阵列上，中间没有 LVM 层
 	KindUnsupported = "unsupported" // 真跨盘卷 / 阵列不健康 / 其它
 )
 
@@ -182,6 +183,40 @@ func VGs() ([]VGInfo, error) {
 		out = append(out, VGInfo{VG: strings.TrimSpace(parts[0]), VGUuid: strings.TrimSpace(parts[1])})
 	}
 	return out, nil
+}
+
+// AllPVs 返回当前全部物理卷路径（用来判断某个 md 阵列有没有被 LVM 用掉）。
+func AllPVs() []string {
+	r, err := Run(10*time.Second, "pvs", "--noheadings", "-o", "pv_name")
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(r.Stdout), "\n") {
+		if p := strings.TrimSpace(line); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// ActiveMdDevs 返回当前已组装的 md 阵列设备路径（/dev/mdN）。
+func ActiveMdDevs() []string {
+	names, err := os.ReadDir("/sys/block")
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, n := range names {
+		if !strings.HasPrefix(n.Name(), "md") {
+			continue
+		}
+		dev := "/dev/" + n.Name()
+		if st, err := os.Stat(dev); err == nil && isBlockDevMode(st.Mode()) {
+			out = append(out, dev)
+		}
+	}
+	return out
 }
 
 // VGActivate 按 UUID 激活卷组（幂等；已激活的执行也是安全的）。
@@ -375,8 +410,8 @@ func BtrfsSubvolIDsErr(dev string) ([]BtrfsSubvol, error) {
 	}
 	if st, err := os.Stat(dev); err != nil {
 		return nil, fmt.Errorf("%s 不可访问（%v）：逻辑卷未激活，设备节点缺失", dev, err)
-	} else if !isBlockDevMode(st.Mode()) {
-		return nil, fmt.Errorf("%s 不是块设备（%s）：设备节点异常，请激活卷组后重试", dev, st.Mode().Type())
+	} else if !st.IsDir() && !isBlockDevMode(st.Mode()) {
+		return nil, fmt.Errorf("%s 不是块设备也不是目录（%s）：设备节点异常，请激活卷组后重试", dev, st.Mode().Type())
 	}
 	// 大卷（十几 T）上 subvolume list 可能较慢，超时给足
 	r, err := Run(90*time.Second, "btrfs", "subvolume", "list", dev)
@@ -397,6 +432,49 @@ func BtrfsSubvolIDsErr(dev string) ([]BtrfsSubvol, error) {
 		}
 	}
 	return subs, nil
+}
+
+// BtrfsSubvolsViaMount 只读挂载 btrfs 的 FS tree 后列出子卷。
+//
+// 真机实测（fnOS + btrfs-progs v6.2）：直接对块设备执行
+// `btrfs subvolume list /dev/dm-N` 会报 "ERROR: not a directory / can't access"，
+// 哪怕 stat -L 确认它确实是 block special file——同一条命令对 /dev/md2 这种裸
+// 块设备也一样失败。结论：v6.2 的 subvolume list 要的是**挂载点**，不是设备。
+//
+// 必须挂 subvolid=5（FS tree）而不是默认子卷：群晖把 default 设成 @syno，
+// 挂默认子卷只能看到 @syno 内部，列不出 @syno 本身。
+func BtrfsSubvolsViaMount(dev string) ([]BtrfsSubvol, error) {
+	dir, err := os.MkdirTemp("", "fn-syno-probe-")
+	if err != nil {
+		return nil, fmt.Errorf("创建临时挂载点失败: %w", err)
+	}
+	defer os.Remove(dir) // 卸载后目录为空，可以删掉
+
+	if r, err := Run(30*time.Second, "mount", "-o", "ro,subvolid=5", dev, dir); err != nil {
+		return nil, fmt.Errorf("只读挂载 %s 失败（stderr: %s）: %w",
+			dev, strings.TrimSpace(r.Stderr), err)
+	}
+	defer func() {
+		// 务必卸载：残留挂载会让后续接管失败，也会挡住磁盘弹出
+		if _, err := Run(30*time.Second, "umount", dir); err != nil {
+			Run(30*time.Second, "umount", "-l", dir) // 惰性卸载兜底
+		}
+	}()
+	return BtrfsSubvolIDsErr(dir)
+}
+
+// BtrfsSubvolsAuto 先用挂载法读子卷（v6.2 上唯一可行），读不到再退回块设备法。
+// 返回子卷、实际用的方式、以及两种都失败时的错误。
+func BtrfsSubvolsAuto(dev string) ([]BtrfsSubvol, string, error) {
+	subs, err := BtrfsSubvolsViaMount(dev)
+	if err == nil {
+		return subs, "mount", nil
+	}
+	mErr := err
+	if subs2, err2 := BtrfsSubvolIDsErr(dev); err2 == nil {
+		return subs2, "dev", nil
+	}
+	return nil, "", fmt.Errorf("只读挂载法：%v；块设备法也失败", mErr)
 }
 
 // BtrfsSubvolIDs 返回 btrfs 子卷列表（忽略错误，仅取结果）。
@@ -722,14 +800,20 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 		if c.DevReady {
 			c.FS = FSType(c.DMPath)
 			if c.FS == "btrfs" {
-				subs, err := BtrfsSubvolIDsErr(c.DMPath)
+				subs, via, err := BtrfsSubvolsAuto(c.DMPath)
 				for _, sv := range subs {
 					c.Subvols = append(c.Subvols, sv.Path)
 				}
 				if err != nil {
 					c.Notes = append(c.Notes, "未读到 btrfs 子卷："+err.Error())
-				} else if len(subs) == 0 {
-					c.Notes = append(c.Notes, "该 btrfs 上没有任何子卷（不符合群晖布局，群晖数据卷应有 @syno）")
+				} else {
+					if via == "mount" {
+						c.Notes = append(c.Notes,
+							"已通过只读挂载（subvolid=5）读取子卷：btrfs-progs v6.2 不支持直接对块设备执行 subvolume list")
+					}
+					if len(subs) == 0 {
+						c.Notes = append(c.Notes, "该 btrfs 上没有任何子卷（不符合群晖布局，群晖数据卷应有 @syno）")
+					}
 				}
 			}
 		}
@@ -750,7 +834,84 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 		}
 		candidates = append(candidates, c)
 	}
+	candidates = append(candidates, detectDirectBtrfs(disks, candidates)...)
 	return candidates, disks, nil
+}
+
+// detectDirectBtrfs 找出「btrfs 直接建在 md 阵列上、中间没有 LVM 层」的盘。
+//
+// 真机实测（用户的机器）：sdc→md2(10.9T)、sdd→md3(14.5T) 就是这种布局，
+// 群晖 Basic 的另一种做法。它们**不会出现在 lvs 里**，所以主循环扫不到，
+// 用户只会看到"我插了 7 块，界面只有 5 块"。这里单独扫一遍把它们列出来，
+// 不支持接管也要让人看见——看不见比不支持更糟。
+func detectDirectBtrfs(disks []BlockDevice, existing []SynoCandidate) []SynoCandidate {
+	pvSet := map[string]bool{}
+	for _, p := range AllPVs() {
+		pvSet[p] = true
+	}
+	// 已经被主循环收进来的设备（LVM 卷）不重复列
+	seen := map[string]bool{}
+	for _, c := range existing {
+		seen[c.DMPath] = true
+	}
+	sizeOf := map[string]string{}
+	diskInfo := map[string]BlockDevice{}
+	for _, d := range disks {
+		sizeOf[d.Name] = d.Size
+		if d.Type == "disk" {
+			diskInfo[d.Name] = d
+		}
+	}
+
+	var out []SynoCandidate
+	for _, md := range ActiveMdDevs() {
+		if pvSet[md] || seen[md] {
+			continue
+		}
+		fs := FSType(md)
+		if fs != "btrfs" {
+			continue
+		}
+		members := MdMembers(md)
+		var phys []string
+		for _, m := range members {
+			phys = append(phys, stripPartition(m))
+		}
+		phys = dedup(phys)
+
+		c := SynoCandidate{
+			VG:        "—", // 没有卷组，这是关键差异
+			LV:        "—",
+			DMPath:    md,
+			MdDev:     md,
+			LVSize:    sizeOf[md],
+			FS:        fs,
+			DevReady:  true, // md 阵列本身就是块设备
+			Kind:      KindDirect,
+			PhysDisks: phys,
+			Subvols:   []string{},
+			Notes:     []string{},
+		}
+		if len(phys) == 1 {
+			c.Disk = phys[0]
+			if d, ok := diskInfo[c.Disk]; ok {
+				c.Model, c.Serial = d.Model, d.Serial
+			}
+		}
+		// 子卷照样读：确认它是群晖布局（应有 @syno），顺便让用户看到内容还在
+		subs, _, err := BtrfsSubvolsAuto(md)
+		for _, sv := range subs {
+			c.Subvols = append(c.Subvols, sv.Path)
+		}
+		if err != nil {
+			c.Notes = append(c.Notes, "未读到 btrfs 子卷："+err.Error())
+		}
+		c.Notes = append(c.Notes,
+			"btrfs 直接建在阵列 "+md+" 上，中间没有 LVM 层（群晖的另一种布局）："+
+				"当前接管流程依赖 LVM 重命名，暂不支持，v0.6 评估")
+		out = append(out, c)
+	}
+	return out
 }
 
 // stripPartition 去掉分区号得到物理盘名：/dev/sdd3 -> /dev/sdd；/dev/nvme0n1p3 -> /dev/nvme0n1。

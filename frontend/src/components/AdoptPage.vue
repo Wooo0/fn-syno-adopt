@@ -228,7 +228,8 @@ onActivated(() => {
           </tr>
         </thead>
         <tbody>
-          <template v-for="c in candidates" :key="c.vgUuid">
+          <!-- 直建 btrfs 没有 vgUuid，用 dmPath 做 key 以免两行撞成一行 -->
+          <template v-for="c in candidates" :key="c.vgUuid || c.dmPath">
             <tr>
               <td>
                 <input
@@ -237,22 +238,30 @@ onActivated(() => {
                 />
               </td>
               <td>
-                <UiBadge :type="c.kind === 'basic' ? 'info' : c.kind === 'raid' ? 'ok' : 'warn'">
+                <UiBadge
+                  :type="
+                    c.kind === 'basic' ? 'info'
+                      : c.kind === 'raid' ? 'ok'
+                        : c.kind === 'direct' ? 'info' : 'warn'
+                  "
+                >
                   {{
                     c.kind === 'raid'
                       ? `${(c.raidLevel || 'RAID').toUpperCase()} ×${c.raidMembers || '?'}`
-                      : c.kind === 'basic' ? '单盘 Basic' : '不支持'
+                      : c.kind === 'basic' ? '单盘 Basic'
+                        : c.kind === 'direct' ? '直建 btrfs' : '不支持'
                   }}
                 </UiBadge>
               </td>
               <td class="mono">{{ c.disk || '未知' }}</td>
               <td>{{ c.model || '—' }}</td>
-              <td class="mono">{{ c.vg }}/{{ c.lv }}</td>
+              <td class="mono">{{ c.kind === 'direct' ? c.mdDev || c.dmPath : `${c.vg}/${c.lv}` }}</td>
               <td>{{ c.lvSize }}</td>
               <td>{{ c.fs || '未知' }}</td>
               <td>
                 <UiBadge v-if="c.adoptable" type="ok">可接管</UiBadge>
                 <UiBadge v-else-if="c.devReady === false" type="err">需激活</UiBadge>
+                <UiBadge v-else-if="c.kind === 'direct'" type="info">v0.6 支持</UiBadge>
                 <UiBadge v-else type="warn">不满足</UiBadge>
               </td>
               <td>

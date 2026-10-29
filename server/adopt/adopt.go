@@ -189,9 +189,11 @@ func BuildPlan(vgUuid string) (*Plan, error) {
 	p.NewVG = genTrimVG()
 	p.MUUID = p.NewVG + "-0"
 
-	// @syno 子卷定位
+	// @syno 子卷定位。
+	// 不能用块设备法：btrfs-progs v6.2 对 `subvolume list /dev/dm-N` 直接报
+	// "not a directory"，只读挂载 FS tree 后才能列出全部子卷。
 	synoID := 0
-	allSubs, subErr := commander.BtrfsSubvolIDsErr(c.DMPath)
+	allSubs, _, subErr := commander.BtrfsSubvolsAuto(c.DMPath)
 	for _, sv := range allSubs {
 		if sv.Path == "@syno" {
 			synoID = sv.ID
@@ -357,21 +359,25 @@ func Execute(p *Plan, dryRun bool, rec *jobs.Recorder) error {
 	dm := "/dev/mapper/" + p.NewVG + "-0"
 
 	// 7. 临时挂载设默认子卷
+	// 必须挂 subvolid=5（FS tree）：群晖把 default 设成 @syno，挂默认子卷的话
+	// 挂载点里就是 @syno 的内容，既列不出 @syno 本身，也无法给它 set-default。
 	tmp := "/mnt/_adopt_tmp"
 	if dryRun {
-		step("临时挂载", "mount "+dm+" "+tmp, "pending", "演练")
+		step("临时挂载 FS tree", "mount -o subvolid=5 "+dm+" "+tmp, "pending", "演练")
 		step("设置默认子卷 @syno", "btrfs subvolume set-default "+strconv.Itoa(p.SynoSubvolID)+" "+tmp, "pending", "演练")
 		step("卸载临时挂载", "umount "+tmp, "pending", "演练")
 	} else {
 		if err := os.MkdirAll(tmp, 0o755); err != nil {
 			return fmt.Errorf("创建临时挂载点失败: %w", err)
 		}
-		if err := runner("临时挂载", "mount", dm, tmp); err != nil {
+		// 挂 FS tree 而非默认子卷，否则列不出 @syno 本身
+		if err := runner("临时挂载 FS tree", "mount", "-o", "subvolid=5", dm, tmp); err != nil {
 			return err
 		}
 		// 执行期重新定位 @syno（防计划与执行间状态变化）
+		// 注意读的是**挂载点** tmp，不是设备 dm：v6.2 对块设备会报 not a directory
 		synoID := 0
-		for _, sv := range commander.BtrfsSubvolIDs(dm) {
+		for _, sv := range commander.BtrfsSubvolIDs(tmp) {
 			if sv.Path == "@syno" {
 				synoID = sv.ID
 				break
