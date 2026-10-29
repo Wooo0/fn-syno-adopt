@@ -1,7 +1,7 @@
 // Package adopt 实现群晖 Basic 盘的零拷贝接管（v0.2 核心）。
 //
 // 原理（对齐社区验证流程 tid=69135）：数据本身不动，只做
-//  1. LVM 改名到飞牛约定：vg1 -> trim_<uuid>，volume_1 -> 0
+//  1. LVM 改名到飞牛约定：vgN -> trim_<uuid>，逻辑卷（volume_N 或 lv）-> 0
 //  2. btrfs 默认子卷切到 @syno（群晖数据子卷，ID 通常 256）
 //  3. 挂载到 /volN
 //  4. 向飞牛 PostgreSQL trim 库 mount 表注册一行（uuid = trim_<uuid>-0）
@@ -38,6 +38,7 @@ var BackupRoot = StateDir + "/backup"
 type Plan struct {
 	VGUuid       string   `json:"vgUuid"`
 	OldVG        string   `json:"oldVG"`
+	OldLV        string   `json:"oldLV"` // 群晖原始逻辑卷名：volume_7 / lv / volume_1（真机上五花八门，不可写死）
 	NewVG        string   `json:"newVG"`
 	DMPath       string   `json:"dmPath"`
 	VolID        int      `json:"volId"`
@@ -179,6 +180,7 @@ func BuildPlan(vgUuid string) (*Plan, error) {
 	p := &Plan{
 		VGUuid:   c.VGUuid,
 		OldVG:    c.VG,
+		OldLV:    c.LV, // 真实逻辑卷名，lvrename 与回滚都以它为准
 		DMPath:   c.DMPath,
 		Disk:     c.Disk,
 		LVSize:   c.LVSize,
@@ -189,14 +191,28 @@ func BuildPlan(vgUuid string) (*Plan, error) {
 
 	// @syno 子卷定位
 	synoID := 0
-	for _, sv := range commander.BtrfsSubvolIDs(c.DMPath) {
+	allSubs, subErr := commander.BtrfsSubvolIDsErr(c.DMPath)
+	for _, sv := range allSubs {
 		if sv.Path == "@syno" {
 			synoID = sv.ID
 			break
 		}
 	}
 	if synoID == 0 {
-		return nil, fmt.Errorf("未在该盘 btrfs 中找到 @syno 数据子卷，接管流程终止（顶层默认子卷不符合群晖布局）")
+		// 报错里带上实际找到的子卷，方便真机排查（比干巴巴一句"找不到"有用得多）
+		names := []string{}
+		for _, sv := range allSubs {
+			names = append(names, sv.Path)
+		}
+		extra := ""
+		if subErr != nil {
+			extra = "（读取子卷失败: " + subErr.Error() + "）"
+		} else if len(names) > 0 {
+			extra = "（该卷上的子卷: " + strings.Join(names, "、") + "）"
+		} else {
+			extra = "（该卷上没有任何子卷，卷可能未激活——可先在接管页点『激活卷组』）"
+		}
+		return nil, fmt.Errorf("未找到 @syno 数据子卷，接管终止%s", extra)
 	}
 	p.SynoSubvolID = synoID
 
@@ -225,7 +241,7 @@ func BuildPlan(vgUuid string) (*Plan, error) {
 		"modprobe crc32c（确保 btrfs 校验模块可用）",
 		"vgcfgbackup 备份卷组配置（按 UUID 定位，文件名带 UUID 短串防覆盖） -> " + BackupRoot + "/<时间戳>/",
 		"vgrename " + shortUUID(p.VGUuid) + "... -> " + p.NewVG + "（按 UUID 定位，重名免疫）",
-		"lvrename " + p.NewVG + " volume_1 0",
+		"lvrename " + p.NewVG + " " + p.OldLV + " 0（原始卷名，非写死的 volume_1）",
 		"vgchange -ay " + p.NewVG,
 		"mount " + p.DMPath + " /mnt/_adopt_tmp（临时挂载设默认子卷）",
 		"btrfs subvolume set-default " + strconv.Itoa(p.SynoSubvolID) + " /mnt/_adopt_tmp（@syno）",
@@ -326,8 +342,8 @@ func Execute(p *Plan, dryRun bool, rec *jobs.Recorder) error {
 
 	// 5. lvrename
 	if dryRun {
-		step("重命名逻辑卷", "lvrename "+p.NewVG+" volume_1 0", "pending", "演练")
-	} else if err := runner("重命名逻辑卷", "lvrename", p.NewVG, "volume_1", "0"); err != nil {
+		step("重命名逻辑卷", "lvrename "+p.NewVG+" "+p.OldLV+" 0", "pending", "演练")
+	} else if err := runner("重命名逻辑卷", "lvrename", p.NewVG, p.OldLV, "0"); err != nil {
 		return err
 	}
 
@@ -509,7 +525,7 @@ func Execute(p *Plan, dryRun bool, rec *jobs.Recorder) error {
 		// 11. 写接管记录：这是回滚的唯一依据（飞牛原生卷同样叫 trim_xxx/0，
 		// 没有记录就无法区分"我们接管的"和"飞牛自己的"）
 		if err := SaveRecord(Record{
-			VGUuid: p.VGUuid, OldVG: p.OldVG, NewVG: p.NewVG, OldLV: "volume_1",
+			VGUuid: p.VGUuid, OldVG: p.OldVG, NewVG: p.NewVG, OldLV: p.OldLV,
 			VolID: p.VolID, MountPoint: p.MountPoint, MUUID: p.MUUID,
 			Disk: p.Disk, LVSize: p.LVSize, Time: Stamp(),
 			MdUUIDs: mdUUIDsOfVG(p.VGUuid),

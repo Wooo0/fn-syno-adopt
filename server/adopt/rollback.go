@@ -1,4 +1,4 @@
-// 回滚：把本应用接管过的卷还原成群晖原样（vg1/volume_1），并撤掉飞牛注册。
+// 回滚：把本应用接管过的卷还原成群晖原样（原卷组名/原逻辑卷名），并撤掉飞牛注册。
 //
 // 典型场景：接管中途失败（vgrename 已成功、mount 表注册失败），盘停在"
 // 半接管"状态——VG 已叫 trim_xxx，而检测面板会跳过 trim_ 前缀的卷，
@@ -121,7 +121,7 @@ func ListAdopted() ([]AdoptedView, error) {
 }
 
 // Rollback 执行一次回滚（dryRun=true 只演练）。
-// 步骤：卸载 → 校验 vg1 未被占用 → vgrename 回 vg1 → lvrename 回 volume_1
+// 步骤：卸载 → 校验原卷组名未被占用 → vgrename 回原名 → lvrename 回原逻辑卷名
 //
 //	→ 删除 mount 表行（先 pg_dump 备份）→ 删除接管记录。
 func Rollback(vgUuid string, dryRun bool, rec *jobs.Recorder) error {

@@ -256,8 +256,9 @@ onActivated(() => {
                 </UiBadge>
               </td>
               <td>
+                <!-- 未激活就用不了（读不到文件系统与子卷）：不管是否可接管都给激活入口 -->
                 <UiButton
-                  v-if="!c.lvActive && !c.adoptable" variant="ghost"
+                  v-if="!c.lvActive" variant="ghost"
                   :disabled="running" @click="activate(c)"
                 >激活卷组</UiButton>
               </td>
@@ -293,6 +294,7 @@ onActivated(() => {
         <span class="arrow">→</span>
         <UiBadge type="info">{{ p.mountPoint }}</UiBadge>
         <span class="plan-meta">新卷组 <span class="mono">{{ p.newVG }}</span></span>
+        <span class="plan-meta">逻辑卷 <span class="mono">{{ p.oldLV }} → 0</span></span>
         <span class="plan-meta">mount.uuid <span class="mono">{{ p.muuid }}</span></span>
       </div>
       <p v-for="w in p.warnings ?? []" :key="w" class="sub warn-text">⚠ {{ w }}</p>

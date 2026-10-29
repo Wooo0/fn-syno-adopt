@@ -45,6 +45,7 @@ export interface Disk {
 export interface AdoptPlan {
   vgUuid: string
   oldVG: string
+  oldLV: string
   newVG: string
   dmPath: string
   volId: number

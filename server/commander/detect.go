@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -73,6 +74,28 @@ const (
 	KindUnsupported = "unsupported" // 真跨盘卷 / 阵列不健康 / 其它
 )
 
+// ReservedLV 群晖的保留区逻辑卷名（每块盘上都有一份，固定 12M，不是数据卷）。
+const ReservedLV = "syno_vg_reserved_area"
+
+var (
+	vgNameRE  = regexp.MustCompile(`^vg\d+$`)
+	volNameRE = regexp.MustCompile(`^volume_\d+$`)
+)
+
+// IsSynoDataVolume 判定是否为群晖数据卷（真机实测，不能只认 vg1/volume_1）。
+//
+// 群晖的命名有两种，混在同一台机器上是常态：
+//   - 老式（DSM 6 及升级上来的）：vg1/volume_7、vg2/volume_6、vg3/volume_8
+//   - DSM 7 新式：vg1001/lv、vg1002/lv
+//
+// 早期版本写成 `VG=="vg1" && LV=="volume_1"`，真机上 8 块盘全部落空。
+func IsSynoDataVolume(vg, lv string) bool {
+	if !vgNameRE.MatchString(vg) {
+		return false
+	}
+	return lv == "lv" || volNameRE.MatchString(lv)
+}
+
 // ---------- 只读探测 ----------
 
 // Lsblk 返回全部块设备树（只读，安全）。
@@ -105,11 +128,12 @@ func LVs() ([]LVInfo, error) {
 		if len(parts) < 6 {
 			continue
 		}
+		// LVM 用 "<" 前缀表示该值是 extent 取整后的上限（如 <14.55t），展示时去掉更干净
 		lvs = append(lvs, LVInfo{
 			VG:     strings.TrimSpace(parts[0]),
 			VGUuid: strings.TrimSpace(parts[1]),
 			LV:     strings.TrimSpace(parts[2]),
-			Size:   strings.TrimSpace(parts[3]),
+			Size:   strings.TrimPrefix(strings.TrimSpace(parts[3]), "<"),
 			Attr:   strings.TrimSpace(parts[4]),
 			DMPath: strings.TrimSpace(parts[5]),
 		})
@@ -286,11 +310,12 @@ type BtrfsSubvol struct {
 	Path string
 }
 
-// BtrfsSubvolIDs 返回 btrfs 文件系统的子卷列表（含 ID，供 set-default 使用）。
-func BtrfsSubvolIDs(dev string) []BtrfsSubvol {
+// BtrfsSubvolIDsErr 返回 btrfs 文件系统的子卷列表（含 ID，供 set-default 使用），
+// 并一并返回失败原因——真机上"读不到子卷"是高频问题，必须能把原因暴露给用户。
+func BtrfsSubvolIDsErr(dev string) ([]BtrfsSubvol, error) {
 	r, err := Run(20*time.Second, "btrfs", "subvolume", "list", dev)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("%s（stderr: %s）", err.Error(), strings.TrimSpace(r.Stderr))
 	}
 	var subs []BtrfsSubvol
 	for _, line := range strings.Split(r.Stdout, "\n") {
@@ -304,6 +329,12 @@ func BtrfsSubvolIDs(dev string) []BtrfsSubvol {
 			}
 		}
 	}
+	return subs, nil
+}
+
+// BtrfsSubvolIDs 返回 btrfs 子卷列表（忽略错误，仅取结果）。
+func BtrfsSubvolIDs(dev string) []BtrfsSubvol {
+	subs, _ := BtrfsSubvolIDsErr(dev)
 	return subs
 }
 
@@ -514,7 +545,10 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 	candidates := []SynoCandidate{}
 	for _, lv := range lvs {
 		if strings.HasPrefix(lv.VG, "trim_") {
-			continue // 飞牛原生卷，跳过
+			continue // 飞牛原生/已接管卷，跳过
+		}
+		if lv.LV == ReservedLV {
+			continue // 群晖 12M 保留区：不是数据卷，不占候选位
 		}
 
 		c := SynoCandidate{
@@ -590,21 +624,37 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 			c.Kind = KindBasic
 		}
 
+		// 子卷：不再要求 LVActive（真机上 lvs 的激活位未必可信，直接试读），
+		// 读不到时把原因写进 notes——否则用户只看到空列表，无从下手。
 		if c.DMPath != "" {
 			c.FS = FSType(c.DMPath)
-			if c.FS == "btrfs" && c.LVActive {
-				for _, sv := range BtrfsSubvolIDs(c.DMPath) {
+			if c.FS == "btrfs" {
+				subs, err := BtrfsSubvolIDsErr(c.DMPath)
+				for _, sv := range subs {
 					c.Subvols = append(c.Subvols, sv.Path)
+				}
+				if err != nil {
+					c.Notes = append(c.Notes,
+						"未读到 btrfs 子卷："+err.Error()+
+							"｜可到「磁盘接管」点『激活卷组』后重新检测")
+				} else if len(subs) == 0 {
+					c.Notes = append(c.Notes, "该 btrfs 上没有任何子卷（不符合群晖布局，群晖数据卷应有 @syno）")
 				}
 			}
 		}
 
-		c.Adoptable = c.FS == "btrfs" && c.VG == "vg1" && c.LV == "volume_1" && len(physDisks) == 1
+		// 数据卷判定：认群晖的两种命名，不再写死 vg1/volume_1
+		isData := IsSynoDataVolume(c.VG, c.LV)
+		c.Adoptable = c.FS == "btrfs" && isData && len(physDisks) == 1
+		if !isData {
+			c.Notes = append(c.Notes, fmt.Sprintf(
+				"%s/%s 不符合群晖数据卷命名（应为 vgN/volume_N 或 vgN/lv），已排除", c.VG, c.LV))
+		}
 		if c.FS == "ext4" {
 			c.Notes = append(c.Notes, "ext4 卷：可挂载读取，但“接管”流程仅支持 btrfs")
 		}
 		if !c.LVActive && c.FS == "" {
-			c.Notes = append(c.Notes, "逻辑卷未激活，无法读取文件系统类型（接管时会自动激活）")
+			c.Notes = append(c.Notes, "逻辑卷未激活，无法读取文件系统类型（可到「磁盘接管」点『激活卷组』）")
 		}
 		candidates = append(candidates, c)
 	}

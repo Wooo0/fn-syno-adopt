@@ -27,6 +27,32 @@ func TestMdHealthy(t *testing.T) {
 	}
 }
 
+// 真机实测（用户 8 块群晖盘）得出的命名规则，早期版本只认 vg1/volume_1 导致全部落空。
+func TestIsSynoDataVolume(t *testing.T) {
+	yes := [][2]string{
+		{"vg1", "volume_7"}, {"vg2", "volume_6"}, {"vg3", "volume_8"},
+		{"vg1", "volume_1"},                // 老式基线
+		{"vg1001", "lv"}, {"vg1002", "lv"}, // DSM 7 新式
+	}
+	no := [][2]string{
+		{"vg1", "syno_vg_reserved_area"}, // 12M 保留区，不是数据卷
+		{"trim_abc123", "0"},             // 飞牛原生/已接管
+		{"vg1", "volume"},                // 缺编号
+		{"vgx", "volume_1"},              // VG 名不符
+		{"vg1", "syno_vg_reserved_area_2"},
+	}
+	for _, c := range yes {
+		if !IsSynoDataVolume(c[0], c[1]) {
+			t.Errorf("应识别为群晖数据卷: %s/%s", c[0], c[1])
+		}
+	}
+	for _, c := range no {
+		if IsSynoDataVolume(c[0], c[1]) {
+			t.Errorf("不应识别为数据卷: %s/%s", c[0], c[1])
+		}
+	}
+}
+
 func TestIsVolPoint(t *testing.T) {
 	cases := map[string]bool{
 		"/vol1":       true,
