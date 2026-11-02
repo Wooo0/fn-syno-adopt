@@ -1,10 +1,13 @@
 #!/bin/bash
 # 救援探查：针对"挂载失败"或"挂载成功但没有子卷"的 btrfs 卷
 #
-# 背景：群晖老盘常见两类问题
-#   1. btrfs 树根损坏 → open_ctree failed / couldn't read tree root
-#   2. mdadm 用错超块（盘上有残留）→ data offset 不同 → 整个 btrfs 错位
-#      （表现为 "invalid root flags, have 0x... expect mask 0x..."，值完全不像正常字段）
+# 背景：群晖老盘常见的挂载失败原因（按 2026-10-29 真机确认的结论排序）
+#   1. ⭐ 群晖 DSM 7 私有 root flag（0x400000000）：主线内核 5.4+ 的 tree-checker
+#      校验不认识就拒绝挂载 → open_ctree -5，对外只表现成 "can't read superblock"。
+#      dmesg 特征：invalid root flags, have 0x... expect mask 0x1000000000001
+#      ★ 盘和数据都没坏！用户态 btrfs restore 不做此校验，可直接读出数据
+#   2. btrfs 树根损坏 → open_ctree failed / couldn't read tree root
+#   3. mdadm 超块残留导致 data offset 错位（已在本机排除：offset 均为 2048 扇区）
 #
 # 本脚本对指定设备逐个尝试所有只读读法，全程不写盘。
 # 用法：sudo bash probe-damaged.sh
@@ -82,7 +85,7 @@ fi
 rmdir "$d" 2>/dev/null
 
 # ---------- 3. sda 的内核报错（之前被 md2/md3 刷屏挡住了） ----------
-say "3) 单独抓 sda 的内核报错"
+say "3) 单独抓 sda 的内核报错（重点看 invalid root flags 的 have 值：0x400000000 = 群晖私有标记）"
 dmesg -C 2>/dev/null    # 先清空缓冲，保证下面看到的都是这次的
 d2=$(mktemp -d /tmp/sda-XXXX)
 mount -t btrfs -o ro,subvolid=5 /dev/mapper/vg1-volume_7 "$d2" 2>/dev/null
