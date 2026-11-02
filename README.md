@@ -1,5 +1,9 @@
 # fn-syno-adopt 群晖迁移助手（飞牛 fnOS 应用）
 
+[![CI](https://github.com/Wooo0/fn-syno-adopt/actions/workflows/ci.yml/badge.svg)](https://github.com/Wooo0/fn-syno-adopt/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-linux%2Famd64-lightgrey.svg)](#环境要求)
+
 把群晖 Basic 数据盘（分区 → mdadm → LVM `vg1/volume_1` → btrfs `@syno` 子卷）
 **零拷贝接管**为飞牛原生存储空间。技术原理来自社区已验证方案
 （fnOS 论坛 tid=69135 + WaterBucket0819/fnos_adopt_synology_disk），本项目将其产品化为 FPK 应用。
