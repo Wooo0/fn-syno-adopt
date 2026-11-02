@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,7 +23,9 @@ var recMu sync.Mutex
 
 // Record 一次成功接管的记录（回滚的唯一依据）。
 type Record struct {
-	VGUuid     string `json:"vgUuid"`     // 卷组 UUID：全程按 UUID 定位，重名免疫
+	// Kind 布局类型：lvm（旧记录无此字段，反序列化为 "" 时按 lvm 处理）/ direct。
+	Kind       string `json:"kind,omitempty"`
+	VGUuid     string `json:"vgUuid"`     // 卷组 UUID（direct 时为 md 阵列 UUID）：全程按 UUID 定位，重名免疫
 	OldVG      string `json:"oldVG"`      // 原名（群晖盘恒为 vg1）
 	NewVG      string `json:"newVG"`      // trim_<uuid>
 	OldLV      string `json:"oldLV"`      // 原名 volume_1
@@ -35,6 +38,8 @@ type Record struct {
 	// MdUUIDs 卷底层 md 阵列的 UUID（用于回滚时从 mdadm.conf 移除我们写过的行）。
 	// v0.5.x 的老记录没有这个字段，反序列后为空 → 回滚跳过移除，向后兼容。
 	MdUUIDs []string `json:"mdUuids,omitempty"`
+	// MdDev direct 布局的 md 阵列设备（如 /dev/md2）；LVM 记录为空。
+	MdDev string `json:"mdDev,omitempty"`
 }
 
 // recordsPath 记录文件绝对路径。
@@ -61,6 +66,13 @@ func loadRecordsLocked() ([]Record, error) {
 	}
 	if out == nil {
 		out = []Record{}
+	}
+	// 防御性清洗：真机发现历史记录 mountPoint 带前导空格（" /vol2"），会让
+	// 挂载点一致性比较、回滚卸载目标等字符串匹配全部落空。读入时统一 TrimSpace。
+	for i := range out {
+		out[i].MountPoint = strings.TrimSpace(out[i].MountPoint)
+		out[i].MUUID = strings.TrimSpace(out[i].MUUID)
+		out[i].NewVG = strings.TrimSpace(out[i].NewVG)
 	}
 	return out, nil
 }

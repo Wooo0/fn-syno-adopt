@@ -8,8 +8,12 @@ import UiEmpty from './components/ui/UiEmpty.vue'
 import UiSidebar, { type SidebarItem } from './components/ui/UiSidebar.vue'
 import AdoptPage from './components/AdoptPage.vue'
 import CleanPage from './components/CleanPage.vue'
+import TasksPage from './components/TasksPage.vue'
+import SharesPage from './components/SharesPage.vue'
 
-const APP_VERSION = 'v0.5.5'
+// 版本号单一来源是 manifest → build.sh 注入后端 → /api/system 返回。
+// 此前这里硬编码 'v0.5.5' 且从不更新，面板版本显示与实际安装包脱节。
+const appVersion = computed(() => sys.value?.version || '')
 
 const sys = ref<SystemInfo | null>(null)
 const candidates = ref<SynoCandidate[]>([])
@@ -47,7 +51,9 @@ async function assembleMd() {
 const navItems: SidebarItem[] = [
   { key: 'detect', label: '检测面板' },
   { key: 'adopt', label: '磁盘接管' },
+  { key: 'shares', label: '我的文件' },
   { key: 'clean', label: '清理工具' },
+  { key: 'tasks', label: '任务历史' },
 ]
 
 const statusOk = computed<boolean | undefined>(() =>
@@ -62,6 +68,10 @@ const adoptableCount = computed(() => candidates.value.filter((c) => c.adoptable
 const allAdopted = computed(
   () => candidates.value.length === 0 && mdArrays.value.length === 0 && adopted.value.length > 0,
 )
+
+// 接管中途失败的盘：卷组已改名为 trim_xxx，检测面板按群晖原样匹配不到，
+// 所以这里单独提示一句并给跳转入口——否则用户会以为盘"丢了"。
+const orphans = computed(() => adopted.value.filter((v) => v.orphan))
 
 async function loadAdopted() {
   try {
@@ -124,7 +134,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app">
-    <UiSidebar v-model="page" :items="navItems" :version="APP_VERSION" :status-ok="statusOk">
+    <UiSidebar v-model="page" :items="navItems" :version="appVersion" :status-ok="statusOk">
       <template #icon="{ item }">
         <!-- 检测面板：放大镜 -->
         <svg v-if="item.key === 'detect'" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -134,9 +144,17 @@ onBeforeUnmount(() => {
         <svg v-else-if="item.key === 'adopt'" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
           <rect x="1.5" y="3.5" width="13" height="9" rx="1.5" /><path d="M4 9.5h8" stroke-linecap="round" /><circle cx="12" cy="6.5" r="0.8" fill="currentColor" stroke="none" />
         </svg>
+        <!-- 我的文件：文件夹 -->
+        <svg v-else-if="item.key === 'shares'" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M1.5 4.5 A1.5 1.5 0 0 1 3 3 h3 l1.5 2 H13 a1.5 1.5 0 0 1 1.5 1.5 v6 A1.5 1.5 0 0 1 13 14 H3 a1.5 1.5 0 0 1 -1.5 -1.5 Z" stroke-linejoin="round" />
+        </svg>
         <!-- 清理工具：扫帚 -->
-        <svg v-else viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <svg v-else-if="item.key === 'clean'" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
           <path d="M9.5 2.5 L13.5 6.5" stroke-linecap="round" /><path d="M8 5 L11 8 L5.5 13.5 H2.5 V10.5 Z" stroke-linejoin="round" />
+        </svg>
+        <!-- 任务历史：时钟列表 -->
+        <svg v-else viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="8" cy="8" r="5.5" /><path d="M8 5.5 V8 l2 1.5" stroke-linecap="round" />
         </svg>
       </template>
 
@@ -177,8 +195,20 @@ onBeforeUnmount(() => {
           </p>
         </UiCard>
 
+        <!-- 接管中断的盘：卷组已改名，检测面板按 vgN/volume_N 匹配不到，必须单独提示，
+             否则用户会以为盘丢了、也不知道去哪救 -->
+        <div v-if="orphans.length" class="banner banner-warn">
+          <span>
+            <b>发现 {{ orphans.length }} 块「接管中断」的盘</b>（
+            <span class="mono">{{ orphans.map((v) => v.disk || v.vg).join('、') }}</span>
+            ）—— 卷组已改名为 trim_xxx 但没挂载、没注册，所以这里和「磁盘接管」的候选列表都匹配不到。
+            去「磁盘接管 → 已接管卷 · 回滚」可一键还原成群晖原样。
+          </span>
+          <button class="banner-link" @click="page = 'adopt'">去处理 →</button>
+        </div>
+
         <UiCard title="疑似群晖数据盘">
-          <template #desc>识别群晖数据卷（mdadm → LVM → btrfs），并区分单盘 Basic / RAID 阵列 / 跨盘卷。检测全程只读、不修改数据；当前版本只接管单盘 Basic，RAID 仅识别不接管（v0.6 支持）。</template>
+          <template #desc>识别群晖数据卷（mdadm → LVM → btrfs），区分单盘 Basic / 直建 btrfs / RAID 阵列。单盘与直建布局支持零拷贝接管，RAID（成员 ≥2）仅识别不接管。检测全程只读、不修改数据。</template>
           <template #actions>
             <UiBadge v-if="candidates.length" type="info">{{ candidates.length }} 个候选</UiBadge>
           </template>
@@ -264,7 +294,6 @@ onBeforeUnmount(() => {
                     <!-- 设备读不到时不能显示"可接管"：那会让用户点了接管才失败 -->
                     <UiBadge v-if="c.adoptable" type="ok">可接管</UiBadge>
                     <UiBadge v-else-if="c.devReady === false" type="err">需激活</UiBadge>
-                    <UiBadge v-else-if="c.kind === 'direct'" type="info">v0.6 支持</UiBadge>
                     <UiBadge v-else type="warn">不满足</UiBadge>
                   </td>
                 </tr>
@@ -302,7 +331,9 @@ onBeforeUnmount(() => {
            否则 v-if 卸载后"切回来自动续轮询"不成立，侧栏"进行中·查看"也会落空 -->
       <KeepAlive>
         <AdoptPage v-if="page === 'adopt'" />
+        <SharesPage v-else-if="page === 'shares'" />
         <CleanPage v-else-if="page === 'clean'" />
+        <TasksPage v-else-if="page === 'tasks'" />
       </KeepAlive>
     </main>
   </div>
@@ -388,6 +419,19 @@ tbody tr:last-child td { border-bottom: 0; }
   color: var(--fui-red);
   border: 1px solid rgba(220, 38, 38, 0.2);
 }
+.banner-warn {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  background: rgba(220, 38, 38, 0.06);
+  color: var(--fui-text-1);
+  border: 1px solid rgba(220, 38, 38, 0.25);
+  line-height: 1.7;
+}
+.banner-link {
+  flex-shrink: 0; border: 1px solid rgba(220, 38, 38, 0.35); background: transparent;
+  color: var(--fui-red); border-radius: var(--fui-radius-sm); padding: 4px 12px;
+  font-size: 13px; cursor: pointer; font-family: inherit;
+}
+.banner-link:hover { background: rgba(220, 38, 38, 0.08); }
 
 /* 侧栏迷你流程条 / 运行中任务指示 */
 .flow-node {

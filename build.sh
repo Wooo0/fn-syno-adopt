@@ -32,7 +32,13 @@ mkdir -p server/web/dist
 cp -r frontend/dist/. server/web/dist/
 
 echo "==> [4/5] 交叉编译 Go 后端 (linux/amd64)"
-(cd server && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ../app/server/fn-syno-adopt .)
+# 版本号单一来源：manifest 的 version 字段 → 注入后端 api.Version → /api/system → 前端侧栏。
+# 此前后端/前端各存一份版本且互不同步（面板曾长期显示写死的 v0.5.5）。
+APP_VER="$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' manifest | head -1 | tr -d '[:space:]')"
+echo "    版本（来自 manifest）: ${APP_VER:-未读到!}"
+(cd server && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
+  -ldflags "-s -w -X fnos-syno-adopt/api.Version=v${APP_VER}" \
+  -o ../app/server/fn-syno-adopt .)
 
 chmod +x cmd/main
 

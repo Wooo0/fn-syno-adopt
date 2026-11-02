@@ -21,6 +21,7 @@ import (
 
 	"fnos-syno-adopt/api"
 	"fnos-syno-adopt/commander"
+	"fnos-syno-adopt/jobs"
 )
 
 const appName = "fn-syno-adopt"
@@ -31,6 +32,9 @@ var distFS embed.FS
 func main() {
 	port := flag.String("port", "18099", "HTTP 监听端口（仅开发模式）")
 	flag.Parse()
+
+	// 历史任务日志载入：应用重启后「任务历史」仍可回看终态日志（含报错详情）
+	jobs.LoadStored()
 
 	mux := http.NewServeMux()
 	api.Register(mux)

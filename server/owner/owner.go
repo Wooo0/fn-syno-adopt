@@ -57,6 +57,10 @@ type ScanResult struct {
 	Stats     []OwnerStat  `json:"stats"`
 	Truncated bool         `json:"truncated"`
 	Suggest   *SuggestUser `json:"suggest"`
+	// 群晖私有 ACL（synoacl）风格的产物：POSIX 权限位全 000，root 能读但
+	// 飞牛文件服务进不去——"我的文件看不到内容"的深层原因（真机 /vol3 实测）。
+	NoPermFiles int `json:"noPermFiles"`
+	NoPermDirs  int `json:"noPermDirs"`
 }
 
 // SuggestUser 来自 /etc/passwd 的飞牛本地用户（uid>=1000）。
@@ -74,7 +78,14 @@ type StatLine struct {
 	Dirs  int
 }
 
-// Scan 流式扫描路径下全部文件的所有权分布（find -xdev -printf）。
+// Scan 流式扫描路径下全部文件的所有权分布（find -printf），
+// 同时统计 POSIX 权限位全 000 的损坏项（群晖 synoacl 遗留）。
+//
+// 这里**不能加 -xdev**（真机 2026-10-31 踩到）：-xdev 的语义是"不跨设备"，
+// 而 btrfs 每个子卷都是独立的 st_dev —— 扫 /vol2/1000 会在 MediaData1 这个
+// 嵌套子卷边界停住，11TB 数据一项都没数到，界面上只显示 2 个目录；
+// 更糟的是 chown -R 会进子卷，导致"扫描看到的"和"实际会改的"完全对不上。
+// 修复流程本来就要跨越子卷，扫描也必须一致地跨过去。
 func Scan(path string) (*ScanResult, error) {
 	path, err := ValidatePath(path)
 	if err != nil {
@@ -82,9 +93,10 @@ func Scan(path string) (*ScanResult, error) {
 	}
 	counts := map[string]*StatLine{}
 	total := 0
+	noPermFiles, noPermDirs := 0, 0
 	r, err := commander.RunStream(30*time.Minute, "find", func(line string) {
-		// 行格式: uid|gid|f|d
-		f := strings.SplitN(line, "|", 3)
+		// 行格式: uid|gid|type|perm（perm 为八进制权限位，如 644 / 000）
+		f := strings.SplitN(line, "|", 4)
 		if len(f) < 2 {
 			return
 		}
@@ -93,7 +105,15 @@ func Scan(path string) (*ScanResult, error) {
 		if e1 != nil || e2 != nil {
 			return
 		}
-		isDir := len(f) == 3 && f[2] == "d"
+		isDir := len(f) >= 3 && f[2] == "d"
+		if len(f) == 4 && f[3] == "0" {
+			// %m 输出八进制无前导零：000 显示为 "0"
+			if isDir {
+				noPermDirs++
+			} else {
+				noPermFiles++
+			}
+		}
 		key := f[0] + ":" + f[1]
 		st, ok := counts[key]
 		if !ok {
@@ -106,9 +126,10 @@ func Scan(path string) (*ScanResult, error) {
 			st.Files++
 		}
 		total++
-	}, path, "-xdev", "-printf", "%U|%G|%y\n")
+	}, path, "-printf", "%U|%G|%y|%m\n")
 
-	res := &ScanResult{Path: path, Total: total, Stats: []OwnerStat{}}
+	res := &ScanResult{Path: path, Total: total, Stats: []OwnerStat{},
+		NoPermFiles: noPermFiles, NoPermDirs: noPermDirs}
 	if err != nil && r.ExitCode != 0 {
 		return res, fmt.Errorf("find 扫描失败: %s", r.Stderr)
 	}
@@ -173,8 +194,14 @@ func Suggest() *SuggestUser {
 }
 
 // Repair 执行所有权修复。dryRun=true 只演练。
-// 步骤：chown -R uid:gid path（必选）；setfacl -R -b path（可选）。
-func Repair(path string, uid, gid int, removeAcl, dryRun bool, rec *jobs.Recorder) error {
+// 步骤：chown -R uid:gid path（必选）；setfacl -R -b path（可选）；
+//
+//	chmod -R u+rwX,a+rX path（可选，fixPerm）。
+//
+// 权限位策略（最低保障，不破坏既有权限）：u+rwX 保证属主可读写（目录可进入），
+// a+rX 保证其他人可读（目录可进入）——群晖 synoacl 遗留的 000 目录修成 755、
+// 000 文件修成 644，而原本就有合理权限的文件一个位都不会变。
+func Repair(path string, uid, gid int, removeAcl, fixPerm, dryRun bool, rec *jobs.Recorder) error {
 	step := func(name, command, status, detail string) {
 		rec.Add(name, command).Done(status, detail)
 	}
@@ -222,11 +249,22 @@ func Repair(path string, uid, gid int, removeAcl, dryRun bool, rec *jobs.Recorde
 		if removeAcl {
 			step("清除扩展 ACL（演练）", "setfacl -R -b "+path, "pending", "演练模式，未修改任何文件")
 		}
+		if fixPerm {
+			step("补权限位（演练）", "chmod -R u+rwX,a+rX "+path, "pending",
+				"演练模式，未修改任何文件。策略：属主补读写、所有人补只读（目录补进入），已有权限不变")
+		}
 		return nil
 	}
 
 	if err := run("变更属主", "chown", "-R", owner, path); err != nil {
 		return err
+	}
+	if fixPerm {
+		// 群晖 synoacl 遗留的 000 权限项：root 能读但飞牛文件服务进不去。
+		// 最低保障策略：只补位不删位，避免破坏用户特意收紧的权限。
+		if err := run("补权限位", "chmod", "-R", "u+rwX,a+rX", path); err != nil {
+			return err
+		}
 	}
 	if removeAcl {
 		// setfacl 可能未安装：缺失时降级为跳过并提示

@@ -50,30 +50,39 @@ func mdUUIDsOfVG(vgUuid string) []string {
 	return out
 }
 
-// PersistMdadmConf 把卷底层 md 阵列的 ARRAY 行追加进 mdadm.conf。
+// PersistMdadmConf 把卷组底层 md 阵列的 ARRAY 行追加进 mdadm.conf（LVM 路径入口）。
+func PersistMdadmConf(vgUuid string, rec *jobs.Recorder) {
+	var mdDevs []string
+	for _, pv := range commander.PVsOfVG(vgUuid) {
+		if strings.HasPrefix(pv, "/dev/md") {
+			mdDevs = append(mdDevs, pv)
+		}
+	}
+	uuids := mdUUIDsOfVG(vgUuid)
+	PersistMdadmConfDevs(uuids, mdDevs, rec)
+}
+
+// PersistMdadmConfDevs 把指定 md 阵列的 ARRAY 行追加进 mdadm.conf。
+// LVM 路径与直建（direct）路径共用：direct 直接传阵列 UUID 与设备本身。
 //
 // 安全约束：
 //   - 只读现有文件 + 追加，绝不覆盖用户原有配置
 //   - 同一 UUID 已存在（不论谁写的）就不重复追加
 //   - 写入失败不视为接管失败（数据已挂载注册成功），只记 warn 并给出手工指引
-func PersistMdadmConf(vgUuid string, rec *jobs.Recorder) {
+func PersistMdadmConfDevs(uuids, mdDevs []string, rec *jobs.Recorder) {
 	step := func(name, command, status, detail string) {
 		rec.Add(name, command).Done(status, detail)
 	}
 
-	uuids := mdUUIDsOfVG(vgUuid)
-	if len(uuids) == 0 {
+	if len(uuids) == 0 || len(mdDevs) == 0 {
 		step("阵列开机自动组装", "(该卷底层不是 md 阵列)", "ok", "跳过")
 		return
 	}
 
 	conf := mdConfPath()
 	var lines []string
-	for _, pv := range commander.PVsOfVG(vgUuid) {
-		if !strings.HasPrefix(pv, "/dev/md") {
-			continue
-		}
-		if l := commander.MdConfLine(pv); l != "" {
+	for _, dev := range mdDevs {
+		if l := commander.MdConfLine(dev); l != "" {
 			lines = append(lines, l)
 		}
 	}

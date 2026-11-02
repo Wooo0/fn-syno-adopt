@@ -52,6 +52,7 @@ const ownerRunning = ref(false)
 const ownerConfirm = ref('')
 const ownerDone = ref(false)
 const removeAcl = ref(true)
+const fixPerm = ref(true) // 群晖 synoacl 遗留的 000 权限项（真机 /vol3 全卷 d---------）
 const uid = ref<number | null>(null)
 const gid = ref<number | null>(null)
 const uidName = ref('')
@@ -98,12 +99,14 @@ async function runOwnerRepair(dryRun: boolean) {
   }
   ownerRunning.value = true
   ownerError.value = ''
+  ownerJobId.value = null // 先清旧 job，避免 JobLog 重挂载时闪出上一轮日志
   try {
     const res = await api.ownerRepair({
       path: ownerPath.value,
       uid: uid.value,
       gid: gid.value,
       removeAcl: removeAcl.value,
+      fixPerm: fixPerm.value,
       dryRun,
       confirm: dryRun ? '' : 'REPAIR',
     })
@@ -115,6 +118,8 @@ async function runOwnerRepair(dryRun: boolean) {
 }
 
 function onOwnerJobDone(job: Job | null) {
+  // 防重放：JobLog 重挂载会立刻轮询旧 jobId，其终态会被当成本轮完成，误报"修复完成"。
+  if (!ownerRunning.value) return
   ownerRunning.value = false
   ownerDone.value = !!job && job.status === 'done'
 }
@@ -155,6 +160,7 @@ async function scanEa() {
 async function runEaClean(dryRun: boolean) {
   eaRunning.value = true
   eaError.value = ''
+  eaJobId.value = null // 同上：清掉旧 job，防止重挂载时闪出上一轮日志
   try {
     const res = await api.eadirClean(eaPath.value, dryRun, dryRun ? '' : 'CLEAN')
     eaJobId.value = res.jobId
@@ -165,6 +171,8 @@ async function runEaClean(dryRun: boolean) {
 }
 
 function onEaJobDone(job: Job | null) {
+  // 同上：非本轮发起的 finished（旧 jobId 重放）直接忽略。
+  if (!eaRunning.value) return
   eaRunning.value = false
   eaDone.value = !!job && job.status === 'done'
   if (eaDone.value) {
@@ -243,6 +251,13 @@ onActivated(() => {
 
       <p v-if="ownerError" class="err-text">✗ {{ ownerError }}</p>
 
+      <!-- 群晖 synoacl 遗留的 000 权限项：root 能读，飞牛文件服务进不去 -->
+      <p v-if="ownerScanRes && (ownerScanRes.noPermDirs || ownerScanRes.noPermFiles)" class="perm-warn">
+        ⚠ 检测到权限位损坏（000）：<strong>{{ ownerScanRes.noPermDirs }}</strong> 个目录、
+        <strong>{{ ownerScanRes.noPermFiles }}</strong> 个文件——这是群晖私有 ACL 的遗留，
+        普通用户与飞牛文件服务完全无法进入。执行修复时勾选「补权限位」即可恢复。
+      </p>
+
       <table v-if="ownerScanRes?.stats?.length">
         <thead>
           <tr><th>uid:gid</th><th>目录</th><th>文件</th><th>归类</th><th></th></tr>
@@ -295,6 +310,11 @@ onActivated(() => {
         <label class="check">
           <input v-model="removeAcl" type="checkbox" :disabled="ownerRunning" />
           同时执行 setfacl -R -b 清除群晖遗留 ACL（推荐）
+        </label>
+        <label>权限位</label>
+        <label class="check">
+          <input v-model="fixPerm" type="checkbox" :disabled="ownerRunning" />
+          补齐损坏的权限位（chmod -R u+rwX,a+rX，群晖 000 项修成 755/644，已有权限不变；推荐）
         </label>
       </div>
 
@@ -463,6 +483,14 @@ onActivated(() => {
 .hint { color: var(--fui-text-2); font-size: 12px; margin: 6px 0 0; }
 .hint-inline { color: var(--fui-text-2); font-size: 12px; margin-left: 8px; }
 .err-text { color: var(--fui-red); font-size: 13px; }
+.perm-warn {
+  background: var(--fui-panel);
+  border-left: 3px solid var(--fui-yellow);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  margin: 8px 0;
+}
 
 .form-grid {
   display: grid;

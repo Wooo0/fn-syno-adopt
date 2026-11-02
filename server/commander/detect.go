@@ -56,6 +56,7 @@ type SynoCandidate struct {
 	FS        string   `json:"fs"`
 	Subvols   []string `json:"subvols"`
 	Adoptable bool     `json:"adoptable"` // 满足接管前置条件（vg1/volume_1 + btrfs + 单盘）
+	Adopted   bool     `json:"adopted"`   // 已由本工具接管（api 层按接管记录打标）——终态，不可再选
 	Notes     []string `json:"notes"`
 
 	// —— 类型与阵列信息（分类由检测决定，不由用户选择）——
@@ -279,22 +280,51 @@ func ResolveBlockDev(dev, vg, lv string) (string, string) {
 // MountPointOf 返回设备当前的挂载点（未挂载返回空串）。
 // /proc/mounts 里的设备名可能是 /dev/mapper/xxx 也可能是 /dev/dm-N，
 // 因此同时比对原始路径与其符号链接解析结果。
+// 注意：设备有多个挂载点时返回第一个（历史救援脚本的只读残留可能排在
+// 接管挂载前面）——需要完整列表用 MountPointsOf。
 func MountPointOf(dev string) string {
+	if mps := MountPointsOf(dev); len(mps) > 0 {
+		return mps[0]
+	}
+	return ""
+}
+
+// MountPointsOf 返回设备当前全部挂载点。
+// btrfs 允许同一文件系统同时挂多处：接管挂载（/volN）与历史救援脚本的
+// 残留挂载（如 /mnt/t2）并存是真实场景，只看第一个会误判"挂载点不一致"。
+func MountPointsOf(dev string) []string {
 	b, err := os.ReadFile("/proc/self/mounts")
 	if err != nil {
-		return ""
+		return nil
 	}
 	targets := map[string]bool{dev: true}
 	if real, e := filepath.EvalSymlinks(dev); e == nil {
 		targets[real] = true
 	}
+	var out []string
 	for _, line := range strings.Split(string(b), "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 2 && targets[f[0]] {
-			return strings.ReplaceAll(f[1], "\\040", " ")
+			out = append(out, strings.ReplaceAll(f[1], "\\040", " "))
 		}
 	}
-	return ""
+	return out
+}
+
+// IsMountpoint 判断某目录当前是否为挂载点（比对 /proc/self/mounts 挂载点列）。
+// 与 MountPointsOf 相反：那个按设备查挂载点，这个按目录查是否被挂载。
+func IsMountpoint(dir string) bool {
+	b, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[1] == dir {
+			return true
+		}
+	}
+	return false
 }
 
 // VolMount 一个已挂载的存储空间挂载点（/volN）。
@@ -324,6 +354,38 @@ func VolMounts() []VolMount {
 		out = append(out, VolMount{Point: mp, Device: f[0], FSType: f[2]})
 	}
 	return out
+}
+
+// MountOptionsOf 返回某挂载点当前的挂载选项（/proc/self/mounts 第 4 字段）。
+// 挂载点不存在返回空串。注意 /proc/mounts 会把空格转义成 \040，这里已还原。
+func MountOptionsOf(mountPoint string) string {
+	b, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 4 && strings.ReplaceAll(f[1], "\\040", " ") == mountPoint {
+			return f[3]
+		}
+	}
+	return ""
+}
+
+// MountHasOption 判断某挂载点是否带指定挂载选项。
+// 按逗号切分后逐项精确比对——不能用 strings.Contains，否则 "trimacl"
+// 会被 "notrimacl" 之类的前缀命中（挂载选项里 negatoin 很常见）。
+func MountHasOption(mountPoint, opt string) bool {
+	opts := MountOptionsOf(mountPoint)
+	if opts == "" {
+		return false
+	}
+	for _, o := range strings.Split(opts, ",") {
+		if o == opt {
+			return true
+		}
+	}
+	return false
 }
 
 // isVolPoint 判断是否为 /volN 形式的挂载点（N 为 1-2 位数字，且不是 /volN/子路径）。
@@ -426,8 +488,15 @@ func BtrfsSubvolIDsErr(dev string) ([]BtrfsSubvol, error) {
 	// 大卷（十几 T）上 subvolume list 可能较慢，超时给足
 	r, err := Run(90*time.Second, "btrfs", "subvolume", "list", dev)
 	if err != nil {
-		return nil, fmt.Errorf("btrfs subvolume list %s 失败（exit=%d｜stderr=%s｜%v）",
-			dev, r.ExitCode, strings.TrimSpace(r.Stderr), err)
+		// 群晖的默认子卷（@syno）在文件系统里**没有目录名**，还有一些残留旧树也是，
+		// 老版本 btrfs-progs 会对它们往 stderr 打警告、甚至以非 0 退出——但 stdout
+		// 里已经列出来的子卷仍然可信。真机 2026-10-31 就是这种盘：重建子卷后留下
+		// 无名旧树，如果这里硬报错，整个接管流程会因为"列子卷失败"而卡死。
+		// 因此：只要 stdout 能解析出子卷就继续；一条都解析不出来才算真失败。
+		if strings.TrimSpace(r.Stdout) == "" {
+			return nil, fmt.Errorf("btrfs subvolume list %s 失败（exit=%d｜stderr=%s｜%v）",
+				dev, r.ExitCode, strings.TrimSpace(r.Stderr), err)
+		}
 	}
 	var subs []BtrfsSubvol
 	for _, line := range strings.Split(r.Stdout, "\n") {
@@ -441,7 +510,80 @@ func BtrfsSubvolIDsErr(dev string) ([]BtrfsSubvol, error) {
 			}
 		}
 	}
+	if len(subs) == 0 && err != nil {
+		return nil, fmt.Errorf("btrfs subvolume list %s 没有列出任何子卷（exit=%d｜stderr=%s）",
+			dev, r.ExitCode, strings.TrimSpace(r.Stderr))
+	}
 	return subs, nil
+}
+
+// dmNameReplacer dm 设备名的 UUID 字符替换（与 adopt 包的 trimDMName 同规则）。
+var dmNameReplacer = strings.NewReplacer(":", "_", "-", "_")
+
+// DmNameFor 由 md 阵列 UUID 生成飞牛原生命名风格的 dm 设备名 trim_<uuid>-0。
+// 放在 commander 以便探测回退使用（adopt 包依赖 commander，反向引用会成环）。
+func DmNameFor(mdUUID string) string {
+	return "trim_" + dmNameReplacer.Replace(mdUUID) + "-0"
+}
+
+// BtrfsSubvolsForDev 读子卷的完整策略（检测与计划生成统一入口）：
+//  1. 自动挂载法（v6.2 唯一常规途径）；
+//  2. 失败则查该设备自身是否已有挂载点（手工 ro 挂载等），直接复用列子卷；
+//  3. 再查本工具的 dm-linear 包装设备是否已挂载（直建盘接管后的再探测场景）。
+//
+// 背景：同一个 btrfs 已挂载时，从另一设备路径再挂会 EBUSY（already mounted）。
+// 真机场景：md2 经 dm 包装挂在 /vol2 后，检测面板再探 /dev/md2 就撞车——
+// 盘和树根都是好的，必须复用现有挂载点，而不是误报"树根损坏"。
+func BtrfsSubvolsForDev(dev string) ([]BtrfsSubvol, string, error) {
+	subs, via, err := BtrfsSubvolsAuto(dev)
+	if err == nil {
+		return subs, via, nil
+	}
+	for _, mp := range MountPointsOf(dev) {
+		if s, e := BtrfsSubvolIDsErr(mp); e == nil {
+			return s, "existing-mount", nil
+		}
+	}
+	if d := MdDetailOf(dev); d.UUID != "" {
+		dm := "/dev/mapper/" + DmNameFor(d.UUID)
+		for _, mp := range MountPointsOf(dm) {
+			if s, e := BtrfsSubvolIDsErr(mp); e == nil {
+				return s, "dm-mount", nil
+			}
+		}
+	}
+	return nil, "", err
+}
+
+// IsSynoSubvolName 判断子卷 path 是否为群晖数据根（@syno）。
+//
+// 真机实锤（2026-10-30，md2）：数据根子卷名可能是怪名——@syno、@\syno\、@//syno/
+// 等（含斜杠/反斜杠变体）。btrfs 子卷名是任意字节串，on-disk 存什么就是什么；
+// 只有走路径访问时斜杠才会被拆解，所以工具全程用子卷 ID 操作，匹配时把分隔符
+// 剥掉再比较即可唯一识别（对干净名 @syno 无影响）。
+func IsSynoSubvolName(path string) bool {
+	return strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' {
+			return -1
+		}
+		return r
+	}, path) == "@syno"
+}
+
+// BtrfsDefaultSubvolID 读挂载点当前默认子卷的 ID（btrfs subvolume get-default）。
+// 用途：接管选数据根时，默认子卷指着的那个就是"正在服役"的正主——
+// 盘上若同时存在干净名/怪名两个候选，优先认 default，避免把默认切到旧副本。
+func BtrfsDefaultSubvolID(mnt string) (int, error) {
+	r, err := Run(15*time.Second, "btrfs", "subvolume", "get-default", mnt)
+	if err != nil {
+		return 0, fmt.Errorf("btrfs subvolume get-default %s 失败（exit=%d｜stderr=%s）",
+			mnt, r.ExitCode, strings.TrimSpace(r.Stderr))
+	}
+	var id int
+	if _, e := fmt.Sscanf(strings.TrimSpace(r.Stdout), "ID %d", &id); e != nil || id <= 0 {
+		return 0, fmt.Errorf("get-default 输出无法解析: %q", strings.TrimSpace(r.Stdout))
+	}
+	return id, nil
 }
 
 // BtrfsSubvolsViaMount 只读挂载 btrfs 的 FS tree 后列出子卷。
@@ -454,8 +596,6 @@ func BtrfsSubvolIDsErr(dev string) ([]BtrfsSubvol, error) {
 //
 // 必须挂 subvolid=5（FS tree）而不是默认子卷：群晖把 default 设成 @syno，
 // 挂默认子卷只能看到 @syno 内部，列不出 @syno 本身。
-// BtrfsSubvolsViaMount 只读挂载 btrfs 的 FS tree 后列出子卷。
-// 第二个返回值表示是否动用了备份树根（说明该文件系统树根有损坏）。
 func BtrfsSubvolsViaMount(dev string) ([]BtrfsSubvol, bool, error) {
 	dir, err := os.MkdirTemp("", "fn-syno-probe-")
 	if err != nil {
@@ -478,6 +618,26 @@ func BtrfsSubvolsViaMount(dev string) ([]BtrfsSubvol, bool, error) {
 		r2, err2 := Run(30*time.Second, "mount", "-t", "btrfs",
 			"-o", "ro,usebackuproot,subvolid=5", dev, dir)
 		if err2 != nil {
+			// 先查是不是群晖私有标记（真机确认：DSM 7 给共享文件夹子卷写私有 root flag
+			// 0x400000000，主线内核 5.4+ 的 tree-checker 拒绝 → open_ctree -5，对外只
+			// 表现成 "can't read superblock"）。这种情况下盘和数据都没坏，不能再说"树根损坏"。
+			if flag := SynoPrivateFlagHint(); flag != "" {
+				return nil, false, fmt.Errorf(
+					"内核拒绝挂载（%s）。这不是树根损坏：该标记是群晖 DSM 7 写入的私有 root flag，"+
+						"主线内核 5.4+ 校验不通过就拒绝整个挂载。盘和数据都没坏——用户态 btrfs restore "+
+						"不做此校验，可直接读出数据；要原生挂载需给内核 btrfs 模块打补丁（tree-checker 放行）",
+					flag)
+			}
+			// EBUSY 不是树根问题：同一 btrfs 已挂在别处（接管后的 dm 包装、手工 ro 残留等），
+			// 从另一设备路径重复挂载必撞 already mounted。如实说明，避免吓用户。
+			if r.ExitCode == 32 || strings.Contains(r.Stderr, "already mounted") ||
+				strings.Contains(r2.Stderr, "already mounted") {
+				return nil, false, fmt.Errorf(
+					"挂载 %s 失败：already mounted or mount point busy（exit=%d｜stderr=%s）。"+
+						"该文件系统已挂载在别处，同一 btrfs 不允许从另一设备路径重复挂载——"+
+						"这不是损坏，应复用现有挂载点读取子卷",
+					dev, r.ExitCode, strings.TrimSpace(r.Stderr))
+			}
 			return nil, false, fmt.Errorf("只读挂载 %s 失败（exit=%d｜stderr=%s）；"+
 				"用备份树根重试也失败（exit=%d｜stderr=%s）：该 btrfs 树根已损坏，"+
 				"建议先备份数据再修（btrfs check --readonly）",
@@ -511,6 +671,58 @@ func BtrfsSubvolsAuto(dev string) ([]BtrfsSubvol, string, error) {
 		return subs2, "dev", nil
 	}
 	return nil, "", fmt.Errorf("只读挂载法：%v；块设备法也失败", mErr)
+}
+
+// SynoPrivateFlagHint 从内核日志里找群晖私有 root flag 的证据。
+//
+// 真机确认的根因：群晖 DSM 7 给共享文件夹子卷的 root item 写入私有 flag
+// 0x400000000，主线内核 5.4+ 的 tree-checker 校验不认识就判定"元数据损坏"，
+// 拒绝整个挂载（open_ctree -5），对外只表现成 mount 的 "can't read superblock"。
+// 报错形如：invalid root flags, have 0x400000000 expect mask 0x1000000000001
+//
+// 必须在刚尝试过挂载之后调用（内核日志是全局的，只在失败后立即读才可靠）。
+// 返回匹配的报错片段（含 flag 值），没有证据返回空串。
+func SynoPrivateFlagHint() string {
+	r, err := Run(15*time.Second, "dmesg")
+	if err != nil {
+		return ""
+	}
+	hint := ""
+	for _, line := range strings.Split(r.Stdout, "\n") {
+		if i := strings.Index(line, "invalid root flags, have "); i >= 0 {
+			// 取最后一条匹配：dmesg 可能留有历史失败记录，最新的一次才是本次的
+			hint = strings.TrimSpace(line[i:])
+		}
+	}
+	return hint
+}
+
+// BtrfsRestoreRoots 用 btrfs restore -l（纯用户态）列出文件系统的 tree root。
+//
+// 用途：内核拒绝挂载（群晖私有 flag / 树根损坏）时，restore 走用户态、
+// 不做内核那套校验，仍能列出完整 tree root——这是"数据还能救"的直接证据。
+// 只读，不写盘。
+func BtrfsRestoreRoots(dev string) ([]int, error) {
+	if _, err := exec.LookPath("btrfs"); err != nil {
+		return nil, fmt.Errorf("系统缺少 btrfs-progs：%v", err)
+	}
+	r, err := Run(90*time.Second, "btrfs", "restore", "-l", dev)
+	if err != nil {
+		return nil, fmt.Errorf("btrfs restore -l %s 失败（exit=%d｜stderr=%s）",
+			dev, r.ExitCode, strings.TrimSpace(r.Stderr))
+	}
+	var ids []int
+	for _, line := range strings.Split(r.Stdout, "\n") {
+		var id int
+		if _, e := fmt.Sscanf(line, "ID %d", &id); e == nil && id > 0 {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("btrfs restore -l 未列出任何 tree root（输出: %s）",
+			strings.TrimSpace(r.Stdout))
+	}
+	return ids, nil
 }
 
 // BtrfsSubvolIDs 返回 btrfs 子卷列表（忽略错误，仅取结果）。
@@ -794,7 +1006,7 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 			} else {
 				c.Kind = KindRAID
 				c.Notes = append(c.Notes, fmt.Sprintf(
-					"检测到 %d 盘 %s 阵列（状态 %s）：RAID 接管将在 v0.6 提供，当前版本仅识别不接管",
+					"检测到 %d 盘 %s 阵列（状态 %s）：RAID 接管尚未实现，当前版本仅识别不接管",
 					d.Members, d.Level, d.State))
 			}
 		case len(mdDevs) > 1 || len(pvs) > 1:
@@ -833,23 +1045,47 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 
 		// 子卷：不再要求 LVActive（真机上 lvs 的激活位未必可信，直接试读），
 		// 读不到时把原因写进 notes——否则用户只看到空列表，无从下手。
+		// subvolReadOK / hasSyno 同时是「可接管」的必要条件：接管执行时必须
+		// 挂载 FS tree 并把默认子卷切到 @syno，挂载被拒（如群晖私有 root flag、
+		// 树根损坏）或找不到 @syno 的盘，接管必然在中途失败——就不能标可接管。
+		subvolReadOK, hasSyno := false, false
 		if c.DevReady {
 			c.FS = FSType(c.DMPath)
 			if c.FS == "btrfs" {
-				subs, via, err := BtrfsSubvolsAuto(c.DMPath)
+				// 统一入口：自动挂载失败时回退复用设备已有挂载点 / dm 包装挂载点。
+				// 真机场景：md2 已 dm 包装挂 /vol2，再从 /dev/md2 挂就 EBUSY——
+				// 若直接报错会被误读成树根损坏，所以必须走 ForDev 的多级回退。
+				subs, via, err := BtrfsSubvolsForDev(c.DMPath)
+				var synoName string
 				for _, sv := range subs {
 					c.Subvols = append(c.Subvols, sv.Path)
+					if synoName == "" && IsSynoSubvolName(sv.Path) {
+						hasSyno = true
+						synoName = sv.Path
+					}
+				}
+				if hasSyno && synoName != "@syno" {
+					c.Notes = append(c.Notes, fmt.Sprintf(
+						"✔ 数据根子卷名为群晖怪名 %q（含斜杠的命名残留，非显示错误）——"+
+							"工具全程按子卷 ID 操作，接管不受影响", synoName))
 				}
 				if err != nil {
 					c.Notes = append(c.Notes, "未读到 btrfs 子卷："+err.Error())
+					c.Notes = append(c.Notes, rescueRootsNote(c.DMPath)...)
 				} else {
+					subvolReadOK = true
 					if via == "mount-backuproot" {
 						c.Notes = append(c.Notes,
 							"⚠ 该 btrfs 的**主树根已损坏**，本次是用备份树根（usebackuproot）挂载才读到子卷。"+
 								"数据可能不完整，接管前请先自行备份重要文件")
 					} else if via == "mount" {
 						c.Notes = append(c.Notes,
-							"已通过只读挂载（subvolid=5）读取子卷：btrfs-progs v6.2 不支持直接对块设备执行 subvolume list")
+							"✔ 子卷经只读挂载（subvolid=5）读取：btrfs-progs v6.2 的 subvolume list 只认挂载点、"+
+								"不认块设备路径（传设备会报 not a directory），先挂载再列出是正常流程，不是错误")
+					} else if via == "existing-mount" || via == "dm-mount" {
+						c.Notes = append(c.Notes,
+							"✔ 子卷复用该文件系统现有挂载点读取（同一 btrfs 不允许从另一设备路径重复挂载，"+
+								"探测撞 EBUSY 时回退复用是正常流程，不是错误）")
 					}
 					if len(subs) == 0 {
 						c.Notes = append(c.Notes, "该 btrfs 上没有任何子卷（不符合群晖布局，群晖数据卷应有 @syno）")
@@ -859,12 +1095,24 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 		}
 
 		// 数据卷判定：认群晖的两种命名，不再写死 vg1/volume_1。
-		// 关键：设备读不到就不能标"可接管"——否则用户点了接管才失败，比现在更糟。
+		// 关键：设备读不到、子卷读不到、找不到 @syno，都不能标"可接管"——
+		// 否则用户点了接管才失败，比现在更糟。
 		isData := IsSynoDataVolume(c.VG, c.LV)
-		c.Adoptable = c.DevReady && c.FS == "btrfs" && isData && len(physDisks) == 1
 		if !isData {
 			c.Notes = append(c.Notes, fmt.Sprintf(
 				"%s/%s 不符合群晖数据卷命名（应为 vgN/volume_N 或 vgN/lv），已排除", c.VG, c.LV))
+		}
+		c.Adoptable = c.DevReady && c.FS == "btrfs" && isData && len(physDisks) == 1 &&
+			subvolReadOK && hasSyno
+		if !c.Adoptable && c.DevReady && c.FS == "btrfs" && isData && len(physDisks) == 1 {
+			switch {
+			case !subvolReadOK:
+				c.Notes = append(c.Notes,
+					"暂不可接管：接管需要只读挂载该卷并定位 @syno 子卷（用于切换默认子卷），挂载被拒就无从执行")
+			case !hasSyno:
+				c.Notes = append(c.Notes,
+					"暂不可接管：该卷上没有 @syno 数据子卷，不符合群晖数据卷布局，无法切换默认子卷")
+			}
 		}
 		if c.FS == "ext4" {
 			c.Notes = append(c.Notes, "ext4 卷：可挂载读取，但“接管”流程仅支持 btrfs")
@@ -882,8 +1130,11 @@ func DetectSynologyDisks() ([]SynoCandidate, []BlockDevice, error) {
 //
 // 真机实测（用户的机器）：sdc→md2(10.9T)、sdd→md3(14.5T) 就是这种布局，
 // 群晖 Basic 的另一种做法。它们**不会出现在 lvs 里**，所以主循环扫不到，
-// 用户只会看到"我插了 7 块，界面只有 5 块"。这里单独扫一遍把它们列出来，
-// 不支持接管也要让人看见——看不见比不支持更糟。
+// 用户只会看到"我插了 7 块，界面只有 5 块"。这里单独扫一遍把它们列出来。
+//
+// v0.6：布局健康（阵列 clean + 读得到 @syno 子卷）的直建盘直接标可接管。
+// 直建布局没有 LVM 层，接管不需要 vgrename/lvrename，比 Basic 路径还少几步
+// （见 adopt.BuildPlanDirect）。
 func detectDirectBtrfs(disks []BlockDevice, existing []SynoCandidate) []SynoCandidate {
 	pvSet := map[string]bool{}
 	for _, p := range AllPVs() {
@@ -919,6 +1170,10 @@ func detectDirectBtrfs(disks []BlockDevice, existing []SynoCandidate) []SynoCand
 		}
 		phys = dedup(phys)
 
+		// 阵列健康：degraded / rebuilding 的直建阵列禁止接管（与 RAID 路径同一标准）
+		d := MdDetailOf(md)
+		healthy := MdHealthy(d)
+
 		c := SynoCandidate{
 			VG:        "—", // 没有卷组，这是关键差异
 			LV:        "—",
@@ -932,23 +1187,65 @@ func detectDirectBtrfs(disks []BlockDevice, existing []SynoCandidate) []SynoCand
 			Subvols:   []string{},
 			Notes:     []string{},
 		}
+		c.RaidLevel, c.RaidMembers = d.Level, d.Members
+		c.RaidActive, c.RaidHealth, c.RaidSize = d.Active, d.State, d.Size
 		if len(phys) == 1 {
 			c.Disk = phys[0]
 			if d, ok := diskInfo[c.Disk]; ok {
 				c.Model, c.Serial = d.Model, d.Serial
 			}
 		}
-		// 子卷照样读：确认它是群晖布局（应有 @syno），顺便让用户看到内容还在
-		subs, _, err := BtrfsSubvolsAuto(md)
+		// 子卷照样读：确认它是群晖布局（应有 @syno），顺便让用户看到内容还在。
+		// 与主循环同一标准：读不到子卷 / 没有 @syno 就不能标可接管。
+		// 用 ForDev 而非 Auto：直建盘接管后经 dm 包装挂 /volN，再从 /dev/mdN
+		// 自动挂载必撞 EBUSY，需回退复用现有挂载点（否则误报树根损坏）。
+		subvolReadOK, hasSyno := false, false
+		subs, via, err := BtrfsSubvolsForDev(md)
+		var synoName string
 		for _, sv := range subs {
 			c.Subvols = append(c.Subvols, sv.Path)
+			if synoName == "" && IsSynoSubvolName(sv.Path) {
+				hasSyno = true
+				synoName = sv.Path
+			}
+		}
+		if hasSyno && synoName != "@syno" {
+			c.Notes = append(c.Notes, fmt.Sprintf(
+				"✔ 数据根子卷名为群晖怪名 %q（含斜杠的命名残留，非显示错误）——"+
+					"工具全程按子卷 ID 操作，接管不受影响", synoName))
 		}
 		if err != nil {
 			c.Notes = append(c.Notes, "未读到 btrfs 子卷："+err.Error())
+			c.Notes = append(c.Notes, rescueRootsNote(md)...)
+		} else {
+			subvolReadOK = true
+			if via == "mount-backuproot" {
+				c.Notes = append(c.Notes,
+					"⚠ 该 btrfs 的**主树根已损坏**，本次是用备份树根（usebackuproot）挂载才读到子卷。"+
+						"数据可能不完整，接管前请先自行备份重要文件")
+			} else if via == "existing-mount" || via == "dm-mount" {
+				c.Notes = append(c.Notes,
+					"✔ 子卷复用该文件系统现有挂载点读取（探测不再重复挂载，避免 EBUSY 误报）")
+			}
+			if len(subs) == 0 {
+				c.Notes = append(c.Notes, "该 btrfs 上没有任何子卷（不符合群晖布局，群晖数据卷应有 @syno）")
+			}
 		}
-		c.Notes = append(c.Notes,
-			"btrfs 直接建在阵列 "+md+" 上，中间没有 LVM 层（群晖的另一种布局）："+
-				"当前接管流程依赖 LVM 重命名，暂不支持，v0.6 评估")
+		c.Adoptable = healthy && len(phys) >= 1 && subvolReadOK && hasSyno
+		switch {
+		case !healthy:
+			c.Notes = append(c.Notes, fmt.Sprintf(
+				"阵列状态异常（%s，在线 %d/%d）：降级/重建中的阵列禁止接管，请先修复阵列",
+				d.State, d.Active, d.Members))
+		case c.Adoptable:
+			c.Notes = append(c.Notes,
+				"btrfs 直接建在阵列 "+md+" 上，中间没有 LVM 层（群晖的另一种布局）："+
+					"已支持接管——无需 LVM 改名，直接切换默认子卷、挂载并注册")
+		default:
+			c.Notes = append(c.Notes,
+				"btrfs 直接建在阵列 "+md+" 上，中间没有 LVM 层（群晖的另一种布局）："+
+					"当前不满足接管条件（见上方原因）")
+		}
 		out = append(out, c)
 	}
 	return out
@@ -995,4 +1292,33 @@ func dedup(in []string) []string {
 		}
 	}
 	return out
+}
+
+// rescueRootsNote 子卷读不到时，用纯用户态的 btrfs restore -l 再试一次。
+//
+// 内核拒绝挂载（群晖私有 root flag）不等于数据不可读：restore 走用户态、
+// 不做内核 tree-checker 那套校验。能列出 tree root 就是"数据完好可救"的
+// 直接证据，必须告诉用户，否则界面上只剩一句报错，用户会以为盘废了。
+// 只读、不写盘。失败则返回空（不额外添乱）。
+func rescueRootsNote(dev string) []string {
+	ids, err := BtrfsRestoreRoots(dev)
+	if err != nil || len(ids) == 0 {
+		return nil
+	}
+	shown := ids
+	if len(shown) > 6 {
+		shown = shown[:6]
+	}
+	idStr := make([]string, len(shown))
+	for i, id := range shown {
+		idStr[i] = strconv.Itoa(id)
+	}
+	more := ""
+	if len(ids) > 6 {
+		more = fmt.Sprintf(" 等 %d 个", len(ids))
+	}
+	return []string{fmt.Sprintf(
+		"✔ 但 btrfs restore（用户态，不受内核校验影响）能列出 %d 个 tree root（ID: %s%s）："+
+			"文件系统结构完好、数据可救，可用数据抢救（btrfs restore）直接提取文件",
+		len(ids), strings.Join(idStr, "/"), more)}
 }

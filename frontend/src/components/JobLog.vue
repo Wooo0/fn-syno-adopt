@@ -9,6 +9,11 @@ const job = ref<Job | null>(null)
 const error = ref('')
 let timer: number | undefined
 
+// 模块级：同一个 job 的终态只上报一次。
+// 组件会被 v-if 反复卸载/重挂载（第 2 步卡片在 plans 清空时消失），setup 里的局部
+// 变量挡不住重放；放在模块作用域才能跨实例记住"这个 job 已经报过了"。
+const emitted = new Set<string>()
+
 async function poll() {
   if (!props.jobId) return
   try {
@@ -17,13 +22,18 @@ async function poll() {
     error.value = ''
     if (res.job.status === 'done' || res.job.status === 'error') {
       stop()
+      if (emitted.has(res.job.id)) return
+      emitted.add(res.job.id)
       emit('finished', res.job)
     }
   } catch (e) {
     // 轮询失败也必须 emit：否则调用方（AdoptPage）的 running 会永久转圈
     error.value = e instanceof Error ? e.message : String(e)
     stop()
-    emit('finished', { id: props.jobId ?? '', kind: '', status: 'error', steps: [], error: error.value })
+    const id = props.jobId ?? ''
+    if (emitted.has(id)) return
+    emitted.add(id)
+    emit('finished', { id, kind: '', status: 'error', steps: [], error: error.value })
   }
 }
 

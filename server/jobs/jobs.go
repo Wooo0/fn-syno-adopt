@@ -83,6 +83,7 @@ func (j *Job) Finish(err error) {
 		j.Status = "done"
 	}
 	live--
+	saveLocked(j) // 终态落盘：应用重启/页面刷新后仍可在「任务历史」回看
 }
 
 // Get 按 ID 取任务。
