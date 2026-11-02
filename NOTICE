@@ -1,0 +1,47 @@
+fn-syno-adopt — 群晖迁移助手（飞牛 fnOS 应用）
+
+Copyright 2026 半颗茶叶蛋
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--------------------------------------------------------------------------------
+
+商标与归属声明
+
+  "Synology"、"群晖"、"DiskStation"、"DSM" 是 Synology Inc. 的商标。
+  "fnOS"、"飞牛" 是其各自权利人的商标。
+
+  本项目是独立的第三方社区工具，与上述任何公司均无隶属、合作、赞助或背书关系。
+  本项目不包含、不修改、不重新分发上述公司的任何专有代码或二进制文件；
+  仅在运行时读取这些系统留下的存储元数据（LVM / mdadm / btrfs）。
+
+--------------------------------------------------------------------------------
+
+技术来源说明
+
+  本项目的技术原理来自社区已有成果，特此致谢：
+
+  - 飞牛 fnOS 官方论坛帖 tid=69135
+  - WaterBucket0819/fnos_adopt_synology_disk
+
+  本仓库是其产品化实现（Web UI、任务互斥、幂等注册、一键回滚、
+  所有权修复、@eaDir 清理、直建 btrfs 的 dm-linear 注册方案），
+  在上述成果之上独立编写，未复制其源码。
+
+--------------------------------------------------------------------------------
+
+安全边界说明
+
+  本应用以 root 权限运行，会修改 LVM 卷组名、逻辑卷名、飞牛 mount 表注册信息、
+  文件属主与 ACL，并移动 @eaDir 目录。所有写操作均为「先备份、可回滚」设计。
+  但仍请在使用前阅读 README 顶部的「使用前必读」，并自行做好数据备份。

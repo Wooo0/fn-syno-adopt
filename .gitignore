@@ -7,3 +7,15 @@ tools/fnpack
 
 # 交叉编译产物：由 build.sh 生成，不入库（避免与源码漂移）
 app/server/fn-syno-adopt
+
+# 开发期工作记录：含真实局域网 IP、SSH 端口、账号、卷组 UUID 与设备清单，
+# 属于个人环境信息，绝不可进入公开仓库
+.workbuddy/
+
+# 第三方产品界面截图（仅作视觉参考，版权归属其各自厂商），不入库
+docs/ui-reference/
+
+# 本地环境文件与日志
+.env
+*.log
+
