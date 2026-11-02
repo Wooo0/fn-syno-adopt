@@ -143,6 +143,9 @@ postgres 访问仅允许 `sudo -u postgres psql|pg_dump`（sudo 缺失时自动�
 
 ### ① 群晖 DSM 7 的私有 btrfs 标志 —— 最常见的一类
 
+**先摸底再动手**：`docs/inspect-syno-flags.sh` 只读统计私有标记在盘上的分布，
+能分清下面两层各占多少。先确认中的是哪一层，再选后面的路——两层能做的事不一样。
+
 **现象**：检测面板显示「不可接管」，或手动 mount 报 `can't read superblock` / `open_ctree failed: -5`。
 `dmesg` 里能看到两种报错之一：
 
@@ -156,15 +159,45 @@ corrupt leaf: ... ino=xxxx, unknown incompat flags detected: 0x40000000   # inod
 （5.4+ 起收紧的 `tree-checker`）严格校验后拒绝打开。用户态的 `btrfs-progs` 不校验，
 所以 `btrfs restore -l` 反而能完整列出所有子卷。
 
-**已知绕过方式**（都不轻松，自行评估）：
+**三条路，按「对环境的额外要求」从低到高排**（没有一条是零风险，先看懂再动手）：
 
-- 用 **4.4 内核**（DSM 7 自身内核）可以正常读写——实测 4.15 的 Ubuntu 18.04 ESM 版本
-  也会校验 inode 标志，**5.4 / 4.15 都不行**，4.4 是唯一稳妥锚点
-- 给飞牛内核的 `btrfs.ko` 打 `tree-checker` 补丁（社区有 6.x 方案）
-- `btrfs check --repair` 对此**无效**；hex 改标志位也不可取（inode 要逐个清，社区实测失败）
+**1. 拷出来 —— 最稳，飞牛本机就能做**
 
-**推荐处置**：用本仓库的 `docs/rescue-data.sh` 以 `btrfs restore` 只读把数据拷出来，
-再在飞牛里新建存储空间放回去。这条路最稳。
+`btrfs-progs` 是用户态、不做 tree-checker 校验，所以**在这台飞牛上就能读**。
+用 `docs/rescue-data.sh` 跑 `btrfs restore`，先 `-D` 空跑评估再真跑，全程不写源盘。
+代价是要另有一块够大的目标盘，等于搬一次数据。**拿不准用哪条就选这条。**
+
+**2. 原地重建子卷 —— 省一块盘，但需要旧内核环境**
+
+`docs/rebuild-subvol.sh`：在**能正常读盘的内核**里，把内容 reflink 克隆进一个全新子卷——
+新 inode、新 root item 都由那个内核生成，天然不带私有标志；reflink 正常生效时
+不搬字节、不占额外空间。流程 `plan → run → verify → cleanup`，`run` 全程不删不改旧子卷，
+失败就退出、旧数据原样在那儿。本项目的四块盘抢救走的就是这条路。
+
+有两个坑必须知道：
+- **cleanup 之后旧树仍留在盘上**（有意留作回退保险），要删掉它才算彻底干净——
+  root item 层的标志是随旧树一起消失的
+- 删旧子卷**之前**必须先 `set-default` 到新树，否则删默认子卷会报 `EPERM`
+
+**3. 给飞牛内核打补丁 —— 一劳永逸，但要会编内核**
+
+放宽 `tree-checker.c` 里对 root flags 与 inode flags 的两处校验（社区有 6.x 方案，
+如 `limitcool/synology-btrfs-kernel-patch`）。代价是每次升级飞牛内核都要重打一遍。
+
+**关于「哪个内核可以」—— 别只看版本号，要看具体构建：**
+
+| 内核 | 能否读带标志的盘 | 说明 |
+|---|---|---|
+| 4.4 | ✅ 稳妥 | DSM 7 自身内核，最保险的锚点 |
+| 4.15.0-20 | ✅ 可以 | Ubuntu 18.04.1 原始内核，本项目抢救时用的就是它 |
+| 4.15.0-213 | ❌ 不行 | ESM 后期构建，加固已被 backport 进去 |
+| 5.4 及以上主线 | ❌ 不行 | tree-checker 默认严格 |
+
+同为 4.15，早期构建没这批 backport、后期有。所以「内核小于 5.4 就行」是错的，
+「装个 4.15 就行」也是错的——版本号相同，行为可能完全相反。
+
+**无效的做法**：`btrfs check --repair` 对这类标志无效；直接 hex 改标志位也不可取
+（inode 要逐个清，社区实测失败）。
 
 ### ② 其他不支持的情况
 
