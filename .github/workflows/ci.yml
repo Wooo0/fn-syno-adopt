@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 只读权限：CI 不写仓库，PR 来自 fork 时也安全
+permissions:
+  contents: read
+
+# 同一分支连续推送时取消上一次，省 runner 也省等待
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: 后端 · gofmt / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          # 本项目零外部依赖（无 go.sum），不需要模块缓存
+          cache: false
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l server)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未格式化，请执行 gofmt -w server 后提交"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        working-directory: server
+        run: go vet ./...
+
+      # 其中 main_test.go 会校验 go:embed 的 web/dist 自洽性：
+      # index.html 引用的每个 assets 文件必须存在，否则 clone 后打开是白屏
+      - name: go test
+        working-directory: server
+        run: go test ./... -count=1
+
+  frontend:
+    name: 前端 · 类型检查 / 构建 / 产物同步
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装依赖
+        working-directory: frontend
+        run: npm ci
+
+      - name: 类型检查
+        working-directory: frontend
+        run: npm run type-check
+
+      - name: 构建
+        working-directory: frontend
+        run: npm run build
+
+      # server/web/dist 是入库的构建产物（为了 clone 后不装 Node 也能 go build）。
+      # 既然入库，就必须与源码同步：改了前端却忘了重新构建并提交 dist，
+      # 别人 clone 下来 build 出来的就是旧界面。
+      #
+      # 注：这一步依赖 vite 产物的确定性。若因 Node/vite 版本差异出现误报，
+      # 把它改成 continue-on-error: true 即可降级为提示。
+      - name: 检查 server/web/dist 与源码是否同步
+        run: |
+          rm -rf server/web/dist
+          mkdir -p server/web/dist
+          cp -r frontend/dist/. server/web/dist/
+          if ! git diff --quiet -- server/web/dist; then
+            echo "::error::前端已改动但 server/web/dist 未同步，请重新构建后一并提交"
+            git diff --stat -- server/web/dist
+            exit 1
+          fi
